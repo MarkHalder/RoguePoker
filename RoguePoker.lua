@@ -61,6 +61,7 @@ RoguePoker.EVASION_DEFAULTS = {
 RoguePoker.INTERRUPT_DEFAULTS = {
 	{ name = "Kick" },
 	{ name = "Gouge" },
+	{ name = "Kidney Shot", minCP = 1 },
 	{ name = "Blind" },
 	{ name = "Deadly Throw" },
 	{ name = "Throw/Shoot" },
@@ -81,6 +82,7 @@ RoguePoker.energyCost = {
 	["Riposte"]          = 10,
 	["Surprise Attack"]  = 0,
 	["Deadly Throw"]     = 35,
+	["Kidney Shot"]    = 25,
 	["Throw/Shoot"]      = 0,
 	["Feint"]            = 20,
 	["Ghostly Strike"]   = 40,
@@ -150,11 +152,12 @@ local defaults = {
 	},
 	-- interrupt: ordered list of { name, enabled }
 	interrupt = {
-		{ name = "Kick",         enabled = true  },
-		{ name = "Gouge",        enabled = true  },
-		{ name = "Blind",        enabled = false },
-		{ name = "Deadly Throw", enabled = true  },
-		{ name = "Throw/Shoot",  enabled = true  },
+		{ name = "Kick",          enabled = true,  minCP = nil },
+		{ name = "Gouge",         enabled = true,  minCP = nil },
+		{ name = "Kidney Shot", enabled = true,  minCP = 1   },
+		{ name = "Blind",         enabled = false, minCP = nil },
+		{ name = "Deadly Throw",  enabled = true,  minCP = nil },
+		{ name = "Throw/Shoot",   enabled = true,  minCP = nil },
 	},
 }
 
@@ -190,6 +193,7 @@ local function InitDB()
 	if RoguePokerDB.interrupt then
 		for _, ab in ipairs(RoguePokerDB.interrupt) do
 			if ab.name == "Throw" then ab.name = "Throw/Shoot" end
+
 		end
 	end
 	RoguePokerDB.discoveredTextures = RoguePokerDB.discoveredTextures or {}
@@ -235,11 +239,22 @@ function RoguePoker:IsActive(name)
 end
 
 function RoguePoker:AutoAttack()
-	if not IsCurrentAction(72) then AttackTarget() end
+	-- In 1.12, auto-attack state is tracked on the attack action button (slot 72 default)
+	-- Use UnitAffectingCombat as a proxy: if not in combat, start attack
+	-- AttackTarget() is safe to call repeatedly - it only starts if not already attacking
+	-- We track state ourselves via PLAYER_ENTER_COMBAT / PLAYER_LEAVE_COMBAT events
+	if not RoguePoker.isAttacking then
+		AttackTarget()
+	end
 end
 
 function RoguePoker:AtRange()
-	return IsActionInRange(71) == 1
+	-- UnitInRange returns true within ~30 yards, covering all ranged weapons
+	-- Falls back to true if the function is unavailable so we don't silently block
+	if UnitInRange then
+		return UnitInRange("target") == 1
+	end
+	return true
 end
 
 function RoguePoker:GetRangedWeaponType()
@@ -632,6 +647,12 @@ function RoguePoker:Interrupt()
 				elseif wtype == "Wand"     then castName = "Shoot"
 				else castName = nil  -- no ranged weapon equipped, skip
 				end
+			end
+
+			-- Kidney Shot requires minimum combo points
+			if castName == "Kidney Shot" then
+				local cP = GetComboPoints("player")
+				if cP < (ab.minCP or 1) then castName = nil end
 			end
 
 			if castName then
@@ -1129,6 +1150,39 @@ local function RefreshInterruptRows()
 			row.rangeLabel = rangeLabel
 		end
 
+		if ab.name == "Kidney Shot" then
+			local minusBtn = CreateFrame("Button", nil, tab2Panel, "UIPanelButtonTemplate")
+			minusBtn:SetWidth(18)
+			minusBtn:SetHeight(18)
+			minusBtn:SetPoint("TOPLEFT", tab2Panel, "TOPLEFT", 170, y)
+			minusBtn:SetText("-")
+			row.minusBtn = minusBtn
+
+			local cpLabel = tab2Panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+			cpLabel:SetPoint("TOPLEFT", tab2Panel, "TOPLEFT", 192, y - 2)
+			cpLabel:SetText((ab.minCP or 1) .. "CP")
+			cpLabel:SetTextColor(1, 0.8, 0.2)
+			cpLabel:SetWidth(28)
+			row.cpLabel = cpLabel
+
+			local plusBtn = CreateFrame("Button", nil, tab2Panel, "UIPanelButtonTemplate")
+			plusBtn:SetWidth(18)
+			plusBtn:SetHeight(18)
+			plusBtn:SetPoint("TOPLEFT", tab2Panel, "TOPLEFT", 222, y)
+			plusBtn:SetText("+")
+			row.plusBtn = plusBtn
+
+			local function updateCP(delta)
+				local newCP = (RoguePokerDB.interrupt[abIdx].minCP or 1) + delta
+				if newCP < 1 then newCP = 1 end
+				if newCP > 5 then newCP = 5 end
+				RoguePokerDB.interrupt[abIdx].minCP = newCP
+				cpLabel:SetText(newCP .. "CP")
+			end
+			minusBtn:SetScript("OnClick", function() updateCP(-1) end)
+			plusBtn:SetScript("OnClick",  function() updateCP(1)  end)
+		end
+
 		local upBtn = CreateFrame("Button", nil, tab2Panel, "UIPanelButtonTemplate")
 		upBtn:SetWidth(22)
 		upBtn:SetHeight(18)
@@ -1162,24 +1216,92 @@ local function RefreshInterruptRows()
 end
 
 -- ==========================================
+-- Scan & Rebuild (after all local UI functions are defined)
+-- ==========================================
+function RoguePoker:ScanAndRebuild()
+	local db = RoguePokerDB
+	if not db then return end
+
+	-- Reset all three lists to defaults, then filter to known spells
+	db.finishers = deepCopy(defaults.finishers)
+	db.evasion   = deepCopy(defaults.evasion)
+	db.interrupt = deepCopy(defaults.interrupt)
+
+	-- Filter builders
+	knownBuilders = RoguePoker:FilterKnown(RoguePoker.BUILDERS)
+
+	-- Filter finishers
+	local knownFinishers = {}
+	for _, fin in ipairs(db.finishers) do
+		if RoguePoker:HasSpell(fin.name) then
+			knownFinishers[table.getn(knownFinishers) + 1] = fin
+		end
+	end
+	db.finishers = knownFinishers
+
+	-- Filter evasion
+	local knownEvasion = {}
+	for _, ev in ipairs(db.evasion) do
+		if RoguePoker:HasSpell(ev.name) then
+			knownEvasion[table.getn(knownEvasion) + 1] = ev
+		end
+	end
+	db.evasion = knownEvasion
+
+	-- Filter interrupt
+	local knownInterrupt = {}
+	for _, ab in ipairs(db.interrupt) do
+		local abKnown = RoguePoker:HasSpell(ab.name)
+		if ab.name == "Throw/Shoot" then
+			abKnown = RoguePoker:HasSpell("Throw") or RoguePoker:HasSpell("Shoot Bow") or RoguePoker:HasSpell("Shoot Crossbow") or RoguePoker:HasSpell("Shoot Gun") or RoguePoker:HasSpell("Shoot")
+		end
+		if abKnown then
+			knownInterrupt[table.getn(knownInterrupt) + 1] = ab
+		end
+	end
+	db.interrupt = knownInterrupt
+
+	-- Rebuild UI
+	RebuildBuilderButtons()
+	UpdateBuilderHighlight()
+	RefreshFinisherRows()
+	RefreshEvasionRows()
+	RefreshInterruptRows()
+
+	-- Restore option checkboxes
+	alwaysFeintCB:SetChecked(db.alwaysFeint)
+	insigniaCB:SetChecked(db.useInsignia)
+end
+
+-- ==========================================
 -- Version label
 -- ==========================================
 local versionLabel = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 versionLabel:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOMRIGHT", -8, 8)
-versionLabel:SetText("v1.0.3")
+versionLabel:SetText("v1.1.0")
 versionLabel:SetTextColor(0.5, 0.5, 0.5)
 
 -- ==========================================
 -- Save Button (shared)
 -- ==========================================
 local saveBtn = CreateFrame("Button", nil, cfgFrame, "UIPanelButtonTemplate")
-saveBtn:SetWidth(80)
+saveBtn:SetWidth(90)
 saveBtn:SetHeight(24)
-saveBtn:SetPoint("BOTTOM", cfgFrame, "BOTTOM", 0, 12)
+saveBtn:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOM", -4, 12)
 saveBtn:SetText("Save & Close")
 saveBtn:SetScript("OnClick", function()
 	cfgFrame:Hide()
 	print("RoguePoker: Settings saved.")
+end)
+
+local refreshBtn = CreateFrame("Button", nil, cfgFrame, "UIPanelButtonTemplate")
+refreshBtn:SetWidth(110)
+refreshBtn:SetHeight(24)
+refreshBtn:SetPoint("BOTTOMLEFT", cfgFrame, "BOTTOM", 4, 12)
+refreshBtn:SetText("Refresh Talents")
+refreshBtn:SetScript("OnClick", function()
+	RoguePoker:ScanAndRebuild()
+	print("|cFFFFD700RoguePoker|r: Talents refreshed.")
 end)
 
 -- ==========================================
@@ -1202,58 +1324,19 @@ end)
 local loadFrame = CreateFrame("Frame")
 loadFrame:RegisterEvent("VARIABLES_LOADED")
 loadFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+loadFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+loadFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 loadFrame:SetScript("OnEvent", function()
-	if event == "VARIABLES_LOADED" then
+	if event == "PLAYER_REGEN_DISABLED" then
+		RoguePoker.isAttacking = true
+	elseif event == "PLAYER_REGEN_ENABLED" then
+		RoguePoker.isAttacking = false
+	elseif event == "VARIABLES_LOADED" then
 		InitDB()
 
 	elseif event == "PLAYER_ENTERING_WORLD" then
 		if not RoguePokerDB then return end
-
-		-- Spellbook is ready now - filter lists to known spells
-		knownBuilders = RoguePoker:FilterKnown(RoguePoker.BUILDERS)
-
-		-- Filter finishers to known spells
-		local knownFinishers = {}
-		for _, fin in ipairs(RoguePokerDB.finishers) do
-			if RoguePoker:HasSpell(fin.name) then
-				knownFinishers[table.getn(knownFinishers) + 1] = fin
-			end
-		end
-		RoguePokerDB.finishers = knownFinishers
-
-		-- Filter evasion to known spells
-		local knownEvasion = {}
-		for _, ev in ipairs(RoguePokerDB.evasion) do
-			if RoguePoker:HasSpell(ev.name) then
-				knownEvasion[table.getn(knownEvasion) + 1] = ev
-			end
-		end
-		RoguePokerDB.evasion = knownEvasion
-
-		-- Filter interrupt to known spells (Throw always included)
-		local knownInterrupt = {}
-		for _, ab in ipairs(RoguePokerDB.interrupt) do
-			local abKnown = RoguePoker:HasSpell(ab.name)
-			if ab.name == "Throw/Shoot" then
-				abKnown = RoguePoker:HasSpell("Throw") or RoguePoker:HasSpell("Shoot Bow") or RoguePoker:HasSpell("Shoot Crossbow") or RoguePoker:HasSpell("Shoot Gun") or RoguePoker:HasSpell("Shoot")
-			end
-			if abKnown then
-				knownInterrupt[table.getn(knownInterrupt) + 1] = ab
-			end
-		end
-		RoguePokerDB.interrupt = knownInterrupt
-
-		-- Build UI
-		RebuildBuilderButtons()
-		UpdateBuilderHighlight()
-		RefreshFinisherRows()
-		RefreshEvasionRows()
-		RefreshInterruptRows()
-		ShowTab(1)
-
-		-- Restore option checkboxes
-		alwaysFeintCB:SetChecked(RoguePokerDB.alwaysFeint)
-		insigniaCB:SetChecked(RoguePokerDB.useInsignia)
+		RoguePoker:ScanAndRebuild()
 
 		print("|cFFFFD700RoguePoker|r loaded successfully!")
 		print("Type |cFFFFD700/rp|r to open the configuration panel.")
