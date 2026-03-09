@@ -9,8 +9,12 @@
 -- ==========================================
 RoguePoker = {}
 RoguePoker.TickTime = 2
-RoguePoker.FirstTick = 0
+RoguePoker.FirstTick = nil
 RoguePoker.Energy = 110
+RoguePoker.isAttacking = false
+RoguePoker.surpriseAttackReady = false
+RoguePoker.riposteReady = false
+RoguePoker.shadowOfDeathPending = false
 
 -- Energy tick tracking
 RoguePoker.f = CreateFrame("Frame", "RoguePokerEnergyFrame", UIParent)
@@ -46,6 +50,7 @@ RoguePoker.FINISHER_DEFAULTS = {
 	{ name = "Eviscerate",      minCP = 5, kind = "damage" },
 	{ name = "Riposte",         minCP = 0, kind = "conditional" },
 	{ name = "Surprise Attack", minCP = 0, kind = "conditional" },
+	{ name = "Mark for Death",  minCP = 0, kind = "conditional" },
 }
 
 -- Evasion abilities
@@ -78,7 +83,8 @@ RoguePoker.energyCost = {
 	["Rupture"]          = 25,
 	["Eviscerate"]       = 35,
 	["Expose Armor"]     = 25,
-	["Shadow of Death"]  = 35,
+	["Shadow of Death"]  = 30,
+	["Mark for Death"]   = 40,
 	["Riposte"]          = 10,
 	["Surprise Attack"]  = 0,
 	["Deadly Throw"]     = 35,
@@ -97,8 +103,7 @@ RoguePoker.energyCost = {
 function RoguePoker:HasSpell(spellName)
 	for i = 1, 200 do
 		local name = GetSpellName(i, BOOKTYPE_SPELL)
-		if not name then break end
-		if name == spellName then return true end
+		if name and name == spellName then return true end
 	end
 	return false
 end
@@ -106,18 +111,19 @@ end
 function RoguePoker:FindSpellid(spellName)
 	for i = 1, 200 do
 		local name = GetSpellName(i, BOOKTYPE_SPELL)
-		if not name then break end
-		if name == spellName then return i end
+		if name and name == spellName then return i end
 	end
 	return 0
 end
 
 -- Scans spellbook and returns filtered list, keeping only known spells
+-- Core rogue builders are always included regardless of scan result
+local ALWAYS_KNOWN_BUILDERS = { ["Sinister Strike"] = true, ["Backstab"] = true }
 function RoguePoker:FilterKnown(list)
 	local result = {}
 	for _, entry in ipairs(list) do
 		local n = type(entry) == "table" and entry.name or entry
-		if RoguePoker:HasSpell(n) then
+		if ALWAYS_KNOWN_BUILDERS[n] or RoguePoker:HasSpell(n) then
 			result[table.getn(result) + 1] = entry
 		end
 	end
@@ -140,7 +146,8 @@ local defaults = {
 		{ name = "Shadow of Death", minCP = 5, enabled = true,  kind = "dot" },
 		{ name = "Eviscerate",      minCP = 5, enabled = true,  kind = "damage" },
 		{ name = "Riposte",         minCP = 0, enabled = true,  kind = "conditional" },
-		{ name = "Surprise Attack", minCP = 0, enabled = true,  kind = "conditional" },
+		{ name = "Surprise Attack", minCP = 0, enabled = false, kind = "conditional" },
+		{ name = "Mark for Death",  minCP = 0, enabled = true,  kind = "conditional" },
 	},
 	-- evasion: ordered list of { name, enabled, healthPct (optional) }
 	evasion = {
@@ -204,6 +211,7 @@ end
 -- ==========================================
 
 function RoguePoker:GetNextTick()
+	if not RoguePoker.FirstTick then return 0 end
 	local i, now = RoguePoker.FirstTick, GetTime()
 	while true do
 		if i > now then return i - now end
@@ -214,7 +222,10 @@ end
 function RoguePoker:ShouldWait(spellName)
 	local cost = RoguePoker.energyCost[spellName] or 35
 	local energy = UnitMana("player")
-	return (energy < cost and RoguePoker:GetNextTick() > 1)
+	-- Never block if we already have enough energy
+	if energy >= cost then return false end
+	-- Block only if the next tick is more than 1 second away
+	return RoguePoker:GetNextTick() > 1
 end
 
 local tooltipFrame = nil
@@ -238,12 +249,42 @@ function RoguePoker:IsActive(name)
 	return false, 0
 end
 
+-- Textures for debuffs we apply to the target
+RoguePoker.targetDebuffTextures = {
+	["Expose Armor"]    = "ability_warrior_riposte",
+	["Shadow of Death"] = "spell_shadow_deathanddecay",
+}
+
+RoguePoker.targetDebuffDuration = {
+	["Expose Armor"]    = 30,
+	["Shadow of Death"] = 24,
+}
+
+local debuffTooltipFrame = nil
+function RoguePoker:IsActiveOnTarget(name)
+	local expiry = RoguePoker.debuffExpiry and RoguePoker.debuffExpiry[name]
+
+	if expiry then
+		local timeLeft = expiry - GetTime()
+		if timeLeft > 0 then
+			return true, timeLeft
+		end
+		RoguePoker.debuffExpiry[name] = nil
+	end
+
+	return false, 0
+end
+
+-- Record expiry when we cast a debuff on the target
+function RoguePoker:TrackDebuff(name, duration)
+	if not RoguePoker.debuffExpiry then RoguePoker.debuffExpiry = {} end
+	RoguePoker.debuffExpiry[name] = GetTime() + duration
+end
+
 function RoguePoker:AutoAttack()
-	-- In 1.12, auto-attack state is tracked on the attack action button (slot 72 default)
-	-- Use UnitAffectingCombat as a proxy: if not in combat, start attack
-	-- AttackTarget() is safe to call repeatedly - it only starts if not already attacking
-	-- We track state ourselves via PLAYER_ENTER_COMBAT / PLAYER_LEAVE_COMBAT events
+	-- Only start auto-attack if not already in combat to avoid toggling it off
 	if not RoguePoker.isAttacking then
+		RoguePoker.isAttacking = true
 		AttackTarget()
 	end
 end
@@ -466,6 +507,7 @@ function RoguePoker:Rota()
 	local energy      = UnitMana("player")
 	local mobTargetsMe = (not UnitIsPlayer("target")) and RoguePoker:IsMyTargetTargetingMe()
 
+
 	RoguePoker:AutoAttack()
 	RoguePoker:AssistPlayer()
 
@@ -492,6 +534,7 @@ function RoguePoker:Rota()
 			end
 		end
 	end
+
 
 	-- ---- Evasion / Tank abilities ----
 	if mobTargetsMe then
@@ -568,31 +611,152 @@ function RoguePoker:Rota()
 		end
 	end
 
+	-- ---- Mark for Death + Shadow of Death combo ----
+	-- If both are enabled and ready, and we have (sodMinCP - 2) or more CP,
+	-- cast Mark for Death first to generate 2 CP and buff AP, then lock Shadow of Death next.
+	-- Exception: if Shadow of Death is disabled or not known, Mark for Death fires on its own.
+	if not RoguePoker.shadowOfDeathPending then
+		local mfdEntry, sodEntry = nil, nil
+		for _, fin in ipairs(db.finishers) do
+			if fin.name == "Mark for Death"  and fin.enabled then mfdEntry = fin end
+			if fin.name == "Shadow of Death" and fin.enabled then sodEntry = fin end
+		end
+		if mfdEntry then
+			local mfdSid = RoguePoker:FindSpellid("Mark for Death")
+			if mfdSid > 0 then
+				local _, mfdDur = GetSpellCooldown(mfdSid, BOOKTYPE_SPELL)
+				if mfdDur == 0 and not RoguePoker:ShouldWait("Mark for Death") then
+					local sodAvailable = false
+					if sodEntry then
+						local sodSid = RoguePoker:FindSpellid("Shadow of Death")
+						if sodSid > 0 then
+							local sodMinCP = sodEntry.minCP or 5
+							local _, sodDur = GetSpellCooldown(sodSid, BOOKTYPE_SPELL)
+							local sodActive = RoguePoker:IsActiveOnTarget("Shadow of Death")
+							if sodDur == 0 and not sodActive and cP >= (sodMinCP - 2) then
+								sodAvailable = true
+							end
+						end
+					end
+					local sodKnown = RoguePoker:HasSpell("Shadow of Death")
+					local sodEnabled = sodEntry ~= nil
+					if sodAvailable then
+						RoguePoker.shadowOfDeathPending = true
+						RoguePoker.shadowOfDeathPendingTime = GetTime()
+						CastSpellByName("Mark for Death")
+						return
+					elseif not sodEnabled or not sodKnown then
+						CastSpellByName("Mark for Death")
+						return
+					end
+				end
+			end
+		end
+	end
+
+	-- If Shadow of Death is pending (Mark for Death just fired), cast it immediately
+	if RoguePoker.shadowOfDeathPending then
+		local elapsed = RoguePoker.shadowOfDeathPendingTime and (GetTime() - RoguePoker.shadowOfDeathPendingTime) or 0
+		if elapsed > 6 then
+			RoguePoker.shadowOfDeathPending = false
+			RoguePoker.shadowOfDeathPendingTime = nil
+		else
+			local sodSid = RoguePoker:FindSpellid("Shadow of Death")
+			if sodSid > 0 then
+				local _, sodDur = GetSpellCooldown(sodSid, BOOKTYPE_SPELL)
+				if sodDur == 0 and not RoguePoker:ShouldWait("Shadow of Death") then
+					RoguePoker.shadowOfDeathPending = false
+					RoguePoker.shadowOfDeathPendingTime = nil
+					CastSpellByName("Shadow of Death")
+					return
+				end
+			else
+				RoguePoker.shadowOfDeathPending = false
+				RoguePoker.shadowOfDeathPendingTime = nil
+			end
+			return
+		end
+	end
+
 	-- ---- Finishers (work down priority list) ----
 	for _, fin in ipairs(db.finishers) do
 		if fin.enabled then
 			local name = fin.name
 			local kind = fin.kind or "damage"
+			local minCP = fin.minCP or 1
 
 			-- Conditional abilities: no CP requirement, fire when available
 			if kind == "conditional" then
+				-- Mark for Death is handled exclusively by the combo block above
+				if name == "Mark for Death" then
+					-- skip, handled by MfD+SoD combo logic
+				else
 				local sid = RoguePoker:FindSpellid(name)
 				if sid > 0 then
 					local _, dur = GetSpellCooldown(sid, BOOKTYPE_SPELL)
-					if dur == 0 then
+					local canFire = dur == 0
+					-- Surprise Attack only fires when dodge proc is active
+					if name == "Surprise Attack" then
+						-- Expire the proc if more than 3s have passed since the dodge
+						if RoguePoker.surpriseAttackTime and (GetTime() - RoguePoker.surpriseAttackTime) > 3 then
+							RoguePoker.surpriseAttackReady = false
+							RoguePoker.surpriseAttackTime = nil
+						end
+						canFire = canFire and RoguePoker.surpriseAttackReady
+					end
+					-- Riposte only fires when parry proc is active
+					if name == "Riposte" then
+						canFire = canFire and RoguePoker.riposteReady
+					end
+					if canFire then
 						if not RoguePoker:ShouldWait(name) then
+							if name == "Surprise Attack" then
+								RoguePoker.surpriseAttackReady = false
+								RoguePoker.surpriseAttackTime = nil
+							elseif name == "Riposte" then
+								RoguePoker.riposteReady = false
+							end
 							CastSpellByName(name)
 							return
 						end
 					end
 				end
+				end
 
 			-- All other finishers require minimum CP
-			elseif cP >= fin.minCP then
+			elseif cP >= minCP then
 				-- For Rupture, activity is indicated by "Taste for Blood" buff on player
-				local checkName = name
-				if name == "Rupture" then checkName = "Taste for Blood" end
-				local active, timeLeft = RoguePoker:IsActive(checkName)
+				-- For Expose Armor, check the debuff on the target
+				local active, timeLeft
+				if name == "Rupture" then
+					active, timeLeft = RoguePoker:IsActive("Taste for Blood")
+				elseif name == "Expose Armor" then
+					active, timeLeft = RoguePoker:IsActiveOnTarget("Expose Armor")
+					-- Failsafe: if CP threshold is met, do a live texture scan to confirm debuff is actually on target
+					-- If it's missing despite our timer saying active, reset and recast
+					if active and cP >= minCP then
+						local matchTexture = RoguePoker.targetDebuffTextures["Expose Armor"]
+						local found = false
+						if matchTexture then
+							for i = 1, 40 do
+								local texture = UnitDebuff("target", i)
+								if not texture then break end
+								local iconName = string.lower(string.gsub(texture, ".*\\", ""))
+								if iconName == matchTexture then
+									found = true
+									break
+								end
+							end
+						end
+						if not found then
+							-- Timer says active but debuff is gone - force recast
+							RoguePoker.debuffExpiry["Expose Armor"] = nil
+							active, timeLeft = false, 0
+						end
+					end
+				else
+					active, timeLeft = RoguePoker:IsActive(name)
+				end
 
 				if kind == "buff" then
 					local needsRefresh = (not active) or (active and timeLeft > 0.5 and timeLeft < 2)
@@ -602,7 +766,11 @@ function RoguePoker:Rota()
 					end
 
 				elseif kind == "dot" then
-					if (not active or timeLeft < 5) and not RoguePoker:ShouldWait(name) then
+					local refreshWindow = 5
+					if (not active or timeLeft < refreshWindow) and not RoguePoker:ShouldWait(name) then
+						if name == "Expose Armor" then
+							RoguePoker:TrackDebuff("Expose Armor", 30)
+						end
 						CastSpellByName(name)
 						return
 					end
@@ -613,12 +781,19 @@ function RoguePoker:Rota()
 						return
 					end
 				end
+			else
 			end
 		end
 	end
 
 	-- ---- Combo Builder ----
 	local builder = db.comboBuilder or "Sinister Strike"
+
+	-- Backstab requires being behind the target - fall back to Sinister Strike
+	if builder == "Backstab" and mobTargetsMe then
+		builder = "Sinister Strike"
+	end
+
 	if not RoguePoker:ShouldWait(builder) then
 		CastSpellByName(builder)
 	end
@@ -1286,7 +1461,7 @@ end
 -- ==========================================
 local versionLabel = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 versionLabel:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOMRIGHT", -8, 8)
-versionLabel:SetText("v1.1.2")
+versionLabel:SetText("v1.1.3")
 versionLabel:SetTextColor(0.5, 0.5, 0.5)
 
 -- ==========================================
@@ -1334,17 +1509,56 @@ loadFrame:RegisterEvent("VARIABLES_LOADED")
 loadFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 loadFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 loadFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+loadFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
+loadFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
 loadFrame:SetScript("OnEvent", function()
 	if event == "PLAYER_REGEN_DISABLED" then
 		RoguePoker.isAttacking = true
+		RoguePoker.surpriseAttackReady = false
+		RoguePoker.surpriseAttackTime = nil
+		RoguePoker.riposteReady = false
+		RoguePoker.shadowOfDeathPending = false
+		RoguePoker.shadowOfDeathPendingTime = nil
 	elseif event == "PLAYER_REGEN_ENABLED" then
 		RoguePoker.isAttacking = false
+		RoguePoker.surpriseAttackReady = false
+		RoguePoker.surpriseAttackTime = nil
+		RoguePoker.riposteReady = false
+		RoguePoker.shadowOfDeathPending = false
+		RoguePoker.shadowOfDeathPendingTime = nil
+		RoguePoker.debuffExpiry = {}
+	elseif event == "CHAT_MSG_COMBAT_SELF_MISSES" then
+		if arg1 and string.find(arg1, "dodge") then
+			RoguePoker.surpriseAttackReady = true
+			RoguePoker.surpriseAttackTime = GetTime()
+		end
+		if arg1 and string.find(arg1, "parr") then
+			RoguePoker.riposteReady = true
+		end
+	elseif event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
+		if arg1 and string.find(arg1, "dodge") then
+			RoguePoker.surpriseAttackReady = true
+			RoguePoker.surpriseAttackTime = GetTime()
+		end
+		if arg1 and string.find(arg1, "parr") then
+			RoguePoker.riposteReady = true
+		end
 	elseif event == "VARIABLES_LOADED" then
 		InitDB()
 
 	elseif event == "PLAYER_ENTERING_WORLD" then
 		if not RoguePokerDB then return end
 		knownBuilders = RoguePoker:FilterKnown(RoguePoker.BUILDERS)
+		-- If saved builder is no longer known (respec), reset to first known builder
+		if table.getn(knownBuilders) > 0 then
+			local builderKnown = false
+			for _, b in ipairs(knownBuilders) do
+				if b == RoguePokerDB.comboBuilder then builderKnown = true break end
+			end
+			if not builderKnown then
+				RoguePokerDB.comboBuilder = knownBuilders[1]
+			end
+		end
 		RebuildBuilderButtons()
 		UpdateBuilderHighlight()
 		RefreshFinisherRows()
@@ -1367,5 +1581,15 @@ SlashCmdList["ROGUEPOKR"] = function(msg)
 		cfgFrame:ClearAllPoints()
 		cfgFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 		cfgFrame:Show()
+	end
+end
+
+SLASH_RPCHECK1 = "/rpcheck"
+SlashCmdList["RPCHECK"] = function(msg)
+	print("RP CHECK: target debuffs:")
+	for i = 1, 40 do
+		local texture = UnitDebuff("target", i)
+		if not texture then break end
+		print("RP CHECK: slot "..tostring(i).." texture="..tostring(texture))
 	end
 end
