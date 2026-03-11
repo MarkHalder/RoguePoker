@@ -138,6 +138,7 @@ local defaults = {
 	useInsignia   = true,
 	alwaysFeint   = false,
 	tankMode      = false,
+	pvpMode       = false,
 	-- finishers: ordered list of { name, minCP, enabled }
 	finishers = {
 		{ name = "Slice and Dice",  minCP = 1, enabled = true,  kind = "buff" },
@@ -195,6 +196,7 @@ local function InitDB()
 	if RoguePokerDB.useInsignia   == nil then RoguePokerDB.useInsignia   = defaults.useInsignia   end
 	if RoguePokerDB.alwaysFeint   == nil then RoguePokerDB.alwaysFeint   = defaults.alwaysFeint   end
 	if RoguePokerDB.tankMode      == nil then RoguePokerDB.tankMode      = defaults.tankMode      end
+	if RoguePokerDB.pvpMode       == nil then RoguePokerDB.pvpMode       = defaults.pvpMode       end
 	if isEmpty(RoguePokerDB.finishers) then RoguePokerDB.finishers = deepCopy(defaults.finishers)  end
 	if isEmpty(RoguePokerDB.evasion)   then RoguePokerDB.evasion   = deepCopy(defaults.evasion)    end
 	if isEmpty(RoguePokerDB.interrupt) then RoguePokerDB.interrupt = deepCopy(defaults.interrupt)  end
@@ -292,10 +294,16 @@ function RoguePoker:AutoAttack()
 end
 
 function RoguePoker:AtRange()
-	-- UnitInRange returns true within ~30 yards, covering all ranged weapons
-	-- Falls back to true if the function is unavailable so we don't silently block
+	-- Must be within ranged weapon range (~30 yards) but NOT in melee range (~5 yards)
+	-- CheckInteractDistance(3) = ~10 yards (trade range), used as a melee guard
 	if UnitInRange then
-		return UnitInRange("target") == 1
+		local inRange = UnitInRange("target") == 1
+		if not inRange then return false end
+	end
+	-- If within trade distance (~10 yards) we are too close for ranged abilities
+	if CheckInteractDistance then
+		local tooClose = CheckInteractDistance("target", 3)
+		if tooClose then return false end
 	end
 	return true
 end
@@ -511,7 +519,9 @@ function RoguePoker:Rota()
 
 
 	RoguePoker:AutoAttack()
-	RoguePoker:AssistPlayer()
+	if not db.pvpMode then
+		RoguePoker:AssistPlayer()
+	end
 
 	-- Insignia on bad status
 	if db.useInsignia and RoguePoker:IsBadStatus() then
@@ -1275,7 +1285,7 @@ local function RefreshEvasionRows()
 end
 
 -- ---- Section: Options (Tab 1) ----
-local optionsY = -470
+local optionsY = -440
 
 local optTitle = tab1Panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 optTitle:SetPoint("TOPLEFT", tab1Panel, "TOPLEFT", 10, optionsY)
@@ -1289,6 +1299,10 @@ local alwaysFeintCB, _ = MakeCheckbox(tab1Panel, "Always Feint (reduces threat)"
 local insigniaCB, _ = MakeCheckbox(tab1Panel, "Use Insignia when stunned", 10, optionsY - 40,
 	function() return RoguePokerDB and RoguePokerDB.useInsignia end,
 	function(v) if RoguePokerDB then RoguePokerDB.useInsignia = v end end)
+
+local pvpModeCB, _ = MakeCheckbox(tab1Panel, "PvP Mode (disables Assist)", 10, optionsY - 62,
+	function() return RoguePokerDB and RoguePokerDB.pvpMode end,
+	function(v) if RoguePokerDB then RoguePokerDB.pvpMode = v end end)
 
 -- ==========================================
 -- TAB 2: Interrupt
@@ -1466,6 +1480,7 @@ function RoguePoker:ScanAndRebuild()
 	alwaysFeintCB:SetChecked(db.alwaysFeint)
 	insigniaCB:SetChecked(db.useInsignia)
 	tankModeCB:SetChecked(db.tankMode)
+	pvpModeCB:SetChecked(db.pvpMode)
 end
 
 -- ==========================================
@@ -1473,7 +1488,7 @@ end
 -- ==========================================
 local versionLabel = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 versionLabel:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOMRIGHT", -8, 8)
-versionLabel:SetText("v1.1.4")
+versionLabel:SetText("v1.1.5")
 versionLabel:SetTextColor(0.5, 0.5, 0.5)
 
 -- ==========================================
@@ -1583,6 +1598,7 @@ loadFrame:SetScript("OnEvent", function()
 		alwaysFeintCB:SetChecked(RoguePokerDB.alwaysFeint)
 		insigniaCB:SetChecked(RoguePokerDB.useInsignia)
 		tankModeCB:SetChecked(RoguePokerDB.tankMode)
+		pvpModeCB:SetChecked(RoguePokerDB.pvpMode)
 		print("|cFFFFD700RoguePoker|r loaded. Type |cFFFFD700/rp|r to configure.")
 	end
 end)
