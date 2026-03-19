@@ -346,6 +346,21 @@ function RoguePoker:AssistPlayer()
 	if UnitIsPlayer("target") then AssistUnit("target") end
 end
 
+function RoguePoker:AssistNamedPlayer()
+	local db = RoguePokerDB
+	local name = db and db.autoAssistName
+	if not name or name == "" then
+		print("|cFFFFD700RoguePoker|r: No assist target set. Use /rp to configure.")
+		return
+	end
+	TargetByName(name)
+	if UnitExists("target") then
+		AssistUnit("target")
+	else
+		print("|cFFFFD700RoguePoker|r: Could not find player: " .. name)
+	end
+end
+
 function RoguePoker:AutoAssistTarget()
 	local db = RoguePokerDB
 	if not db.autoAssist then return end
@@ -745,7 +760,9 @@ function RoguePoker:Rota()
 							RoguePoker.surpriseAttackReady = false
 							RoguePoker.surpriseAttackTime = nil
 						end
-						canFire = canFire and RoguePoker.surpriseAttackReady
+						local start, duration = GetSpellCooldown(sid, BOOKTYPE_SPELL)
+						local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
+						canFire = RoguePoker.surpriseAttackReady and not onCooldown
 					end
 					-- Riposte only fires when parry proc is active
 					if name == "Riposte" then
@@ -753,7 +770,9 @@ function RoguePoker:Rota()
 							RoguePoker.riposteReady = false
 							RoguePoker.riposteTime = nil
 						end
-						canFire = canFire and RoguePoker.riposteReady
+						local start, duration = GetSpellCooldown(sid, BOOKTYPE_SPELL)
+						local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
+						canFire = RoguePoker.riposteReady and not onCooldown
 					end
 					if canFire then
 						if not RoguePoker:ShouldWait(name) then
@@ -809,7 +828,7 @@ function RoguePoker:Rota()
 					end
 
 				elseif kind == "dot" then
-					local refreshWindow = 5
+					local refreshWindow = (name == "Rupture") and 10 or 5
 					if (not active or timeLeft < refreshWindow) and not RoguePoker:ShouldWait(name) then
 						if name == "Expose Armor" then
 							RoguePoker:TrackDebuff("Expose Armor", 30)
@@ -1637,7 +1656,7 @@ end
 -- ==========================================
 local versionLabel = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 versionLabel:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOMRIGHT", -8, 8)
-versionLabel:SetText("v1.1.7")
+versionLabel:SetText("v1.1.8")
 versionLabel:SetTextColor(0.5, 0.5, 0.5)
 
 -- ==========================================
@@ -1686,6 +1705,10 @@ loadFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 loadFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 loadFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
 loadFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
+loadFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS")
+loadFrame:RegisterEvent("CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF")
+loadFrame:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
+loadFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES")
 loadFrame:SetScript("OnEvent", function()
 	if event == "PLAYER_REGEN_DISABLED" then
 		RoguePoker.surpriseAttackReady = false
@@ -1707,7 +1730,7 @@ loadFrame:SetScript("OnEvent", function()
 			RoguePoker.surpriseAttackReady = true
 			RoguePoker.surpriseAttackTime = GetTime()
 		end
-		if arg1 and string.find(arg1, "parr") then
+		if arg1 and string.find(arg1, "You parry") then
 			RoguePoker.riposteReady = true
 			RoguePoker.riposteTime = GetTime()
 		end
@@ -1716,7 +1739,27 @@ loadFrame:SetScript("OnEvent", function()
 			RoguePoker.surpriseAttackReady = true
 			RoguePoker.surpriseAttackTime = GetTime()
 		end
-		if arg1 and string.find(arg1, "parr") then
+		if arg1 and string.find(arg1, "You parry") then
+			RoguePoker.riposteReady = true
+			RoguePoker.riposteTime = GetTime()
+		end
+	elseif event == "CHAT_MSG_COMBAT_SELF_HITS" then
+		if arg1 and string.find(arg1, "You parry") then
+			RoguePoker.riposteReady = true
+			RoguePoker.riposteTime = GetTime()
+		end
+	elseif event == "CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF" then
+		if arg1 and string.find(arg1, "You parry") then
+			RoguePoker.riposteReady = true
+			RoguePoker.riposteTime = GetTime()
+		end
+	elseif event == "CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES" then
+		if arg1 and string.find(arg1, "You parry") then
+			RoguePoker.riposteReady = true
+			RoguePoker.riposteTime = GetTime()
+		end
+	elseif event == "CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES" then
+		if arg1 and string.find(arg1, "You parry") then
 			RoguePoker.riposteReady = true
 			RoguePoker.riposteTime = GetTime()
 		end
@@ -1768,6 +1811,7 @@ SlashCmdList["ROGUEPOKR"] = function(msg)
 		print("|cFFFFD700Commands:|r")
 		print("  |cFFAAAAAA/rp|r        -- Toggle configuration panel")
 		print("  |cFFAAAAAA/rp help|r   -- Show this help text")
+		print("  |cFFAAAAAA/rpassist|r  -- Assist the player set in the Auto Assist box")
 	else
 		if cfgFrame:IsShown() then
 			cfgFrame:Hide()
@@ -1779,6 +1823,11 @@ SlashCmdList["ROGUEPOKR"] = function(msg)
 	end
 end
 
+SLASH_RPASSIST1 = "/rpassist"
+SlashCmdList["RPASSIST"] = function()
+	RoguePoker:AssistNamedPlayer()
+end
+
 SLASH_RPCHECK1 = "/rpcheck"
 SlashCmdList["RPCHECK"] = function(msg)
 	print("RP CHECK: target debuffs:")
@@ -1786,5 +1835,46 @@ SlashCmdList["RPCHECK"] = function(msg)
 		local texture = UnitDebuff("target", i)
 		if not texture then break end
 		print("RP CHECK: slot "..tostring(i).." texture="..tostring(texture))
+	end
+end
+
+-- ==========================================
+-- Parry Debug Sniffer  (/rpsniff on | /rpsniff off)
+-- ==========================================
+local rpSniffFrame = CreateFrame("Frame")
+local rpSniffActive = false
+
+rpSniffFrame:SetScript("OnEvent", function()
+	if not rpSniffActive then return end
+	if arg1 and string.find(arg1, "You parry") then
+		DEFAULT_CHAT_FRAME:AddMessage("|cFFFF6600RPSNIFF|r ["..tostring(event).."] "..tostring(arg1))
+	end
+end)
+
+SLASH_RPSNIFF1 = "/rpsniff"
+SlashCmdList["RPSNIFF"] = function(msg)
+	if msg == "on" then
+		rpSniffActive = true
+		-- Incoming attack events (mob/player attacks you)
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF")
+		-- Also keep these as fallback
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_BUFFS")
+		-- Outgoing miss events (your attack result)
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_MISSES")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES")
+		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE")
+		print("|cFFFFD700RoguePoker|r: Parry sniffer ON. Fight something and let it hit you. Only 'You parry' messages shown.")
+	elseif msg == "off" then
+		rpSniffActive = false
+		rpSniffFrame:UnregisterAllEvents()
+		print("|cFFFFD700RoguePoker|r: Parry sniffer OFF.")
+	else
+		print("|cFFFFD700RoguePoker|r: Usage: /rpsniff on  or  /rpsniff off")
 	end
 end
