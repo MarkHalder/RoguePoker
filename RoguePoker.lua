@@ -11,9 +11,12 @@ RoguePoker = {}
 RoguePoker.TickTime = 2
 RoguePoker.FirstTick = nil
 RoguePoker.Energy = 110
-RoguePoker.surpriseAttackReady = false
-RoguePoker.riposteReady = false
 RoguePoker.shadowOfDeathPending = false
+RoguePoker.inCombat = false
+RoguePoker.defensivePending = nil
+RoguePoker.defensivePendingTime = nil
+RoguePoker.notBehindTarget = false     -- true when we got a "must be behind" error
+RoguePoker.notBehindTime = nil
 
 -- Energy tick tracking
 RoguePoker.f = CreateFrame("Frame", "RoguePokerEnergyFrame", UIParent)
@@ -97,6 +100,21 @@ RoguePoker.energyCost = {
 }
 
 -- ==========================================
+-- Nampower Queue Wrapper
+-- ==========================================
+-- Uses QueueSpellByName if nampower is loaded, otherwise falls back to
+-- CastSpellByName. Since nampower only allows 1 GCD spell in the queue
+-- at a time, calling this will automatically replace any previously
+-- queued spell with the new one -- no manual queue management needed.
+function RoguePoker:QueueOrCast(spellName)
+	if QueueSpellByName then
+		QueueSpellByName(spellName)
+	else
+		CastSpellByName(spellName)
+	end
+end
+
+-- ==========================================
 -- Spellbook Scanner
 -- ==========================================
 function RoguePoker:HasSpell(spellName)
@@ -135,6 +153,9 @@ end
 local defaults = {
 	comboBuilder    = "Sinister Strike",
 	useInsignia     = true,
+	useInsigniaStuns    = true,
+	useInsigniaMovement = true,
+	useSprintMovement   = true,
 	alwaysFeint     = false,
 	tankMode        = false,
 	pvpMode         = false,
@@ -194,7 +215,10 @@ end
 local function InitDB()
 	RoguePokerDB = RoguePokerDB or {}
 	if RoguePokerDB.comboBuilder  == nil then RoguePokerDB.comboBuilder  = defaults.comboBuilder  end
-	if RoguePokerDB.useInsignia   == nil then RoguePokerDB.useInsignia   = defaults.useInsignia   end
+	if RoguePokerDB.useInsignia        == nil then RoguePokerDB.useInsignia        = defaults.useInsignia        end
+	if RoguePokerDB.useInsigniaStuns   == nil then RoguePokerDB.useInsigniaStuns   = defaults.useInsigniaStuns   end
+	if RoguePokerDB.useInsigniaMovement == nil then RoguePokerDB.useInsigniaMovement = defaults.useInsigniaMovement end
+	if RoguePokerDB.useSprintMovement  == nil then RoguePokerDB.useSprintMovement  = defaults.useSprintMovement  end
 	if RoguePokerDB.alwaysFeint   == nil then RoguePokerDB.alwaysFeint   = defaults.alwaysFeint   end
 	if RoguePokerDB.tankMode      == nil then RoguePokerDB.tankMode      = defaults.tankMode      end
 	if RoguePokerDB.pvpMode       == nil then RoguePokerDB.pvpMode       = defaults.pvpMode       end
@@ -289,21 +313,40 @@ end
 
 function RoguePoker:AutoAttack()
 	-- Only enable auto-attack if it isn't already running
-	if UnitExists("target") and not UnitIsDead("target") then
-		if not IsCurrentAction(72) then
+	if UnitExists("target") and not UnitIsDead("target") and UnitCanAttack("player", "target") then
+		local isAutoAttacking = false
+		if GetCurrentCastingInfo then
+			local castId, visId, autoId, casting, channeling, onswing, autoattack = GetCurrentCastingInfo()
+			isAutoAttacking = (autoattack ~= nil and autoattack == 1)
+		else
+			isAutoAttacking = IsCurrentAction(72)
+		end
+		if not isAutoAttacking then
 			AttackTarget()
 		end
 	end
 end
 
 function RoguePoker:AtRange()
-	-- Must be within ranged weapon range (~30 yards) but NOT in melee range (~5 yards)
-	-- CheckInteractDistance(3) = ~10 yards (trade range), used as a melee guard
+	if IsSpellInRange then
+		local wtype = RoguePoker:GetRangedWeaponType()
+		local spellName = nil
+		if     wtype == "Thrown"   then spellName = "Throw"
+		elseif wtype == "Bow"      then spellName = "Shoot Bow"
+		elseif wtype == "Crossbow" then spellName = "Shoot Crossbow"
+		elseif wtype == "Gun"      then spellName = "Shoot Gun"
+		elseif wtype == "Wand"     then spellName = "Shoot"
+		end
+		if spellName then
+			return IsSpellInRange(spellName, "target") == 1
+		end
+		return false
+	end
+	-- Fallback for non-nampower: must be within ranged range but NOT in melee range
 	if UnitInRange then
 		local inRange = UnitInRange("target") == 1
 		if not inRange then return false end
 	end
-	-- If within trade distance (~10 yards) we are too close for ranged abilities
 	if CheckInteractDistance then
 		local tooClose = CheckInteractDistance("target", 3)
 		if tooClose then return false end
@@ -379,143 +422,70 @@ end
 -- ==========================================
 -- Bad Status / Insignia
 -- ==========================================
-RoguePoker.badTextures = {
-    ["Interface\\Icons\\Ability_Ensnare"] = true,
-    ["Interface\\Icons\\Spell_Nature_NullifyDisease"] = false,
-    ["Interface\\Icons\\Spell_Shadow_ShadowWordPain"] = false,
-    ["Interface\\Icons\\Spell_Nature_FaerieFire"] = false,
-    ["Interface\\Icons\\Spell_Shadow_CurseOfTounges"] = false,
-    ["Interface\\Icons\\Spell_Shadow_GatherShadows"] = false,
-    ["Interface\\Icons\\Spell_Fire_Immolation"] = false,
-    ["Interface\\Icons\\Spell_Nature_CorrosiveBreath"] = false,
-    ["Interface\\Icons\\Ability_Creature_Poison_02"] = false,
-    ["Interface\\Icons\\Spell_Fire_FlameBolt"] = false,
-    ["Interface\\Icons\\Spell_Holy_Excorcism_02"] = false,
-    ["Interface\\Icons\\Spell_Nature_NatureTouchDecay"] = false,
-    ["Interface\\Icons\\Spell_Holy_AshesToAshes"] = false,
-    ["Interface\\Icons\\Spell_Magic_PolymorphPig"] = true,
-    ["Interface\\Icons\\INV_Misc_MonsterClaw_03"] = false,
-    ["Interface\\Icons\\Spell_Nature_StrengthOfEarthTotem02"] = false,
-    ["Interface\\Icons\\Spell_Fire_Flare"] = false,
-    ["Interface\\Icons\\Spell_Frost_FrostArmor02"] = false,
-    ["Interface\\Icons\\Spell_ChargePositive"] = false,
-    ["Interface\\Icons\\Spell_Fire_SealOfFire"] = false,
-    ["Interface\\Icons\\Spell_Shadow_NightOfTheDead"] = false,
-    ["Interface\\Icons\\Ability_Hunter_Pet_Bear"] = false,
-    ["Interface\\Icons\\Spell_Nature_Acid_01"] = false,
-    ["Interface\\Icons\\Spell_Holy_SealOfMight"] = false,
-    ["Interface\\Icons\\Ability_Sap"] = true,
-    ["Interface\\Icons\\Spell_Frost_FrostBolt02"] = false,
-    ["Interface\\Icons\\Ability_Warrior_Charge"] = true,
-    ["Interface\\Icons\\Spell_Nature_Slow"] = true,
-    ["Interface\\Icons\\Ability_Hunter_Quickshot"] = false,
-    ["Interface\\Icons\\Ability_ShockWave"] = true,
-    ["Interface\\Icons\\Spell_Nature_StrangleVines"] = true,
-    ["Interface\\Icons\\Spell_Shadow_DeathScream"] = true,
-    ["Interface\\Icons\\Ability_CheapShot"] = true,
-    ["Interface\\Icons\\Spell_Fire_LavaSpawn"] = false,
-    ["Interface\\Icons\\Ability_Warrior_Disarm"] = false,
-    ["Interface\\Icons\\Spell_ChargeNegative"] = false,
-    ["Interface\\Icons\\Spell_Fire_Incinerate"] = false,
-    ["Interface\\Icons\\Spell_Shadow_PsychicScream"] = true,
-    ["Interface\\Icons\\Spell_Fire_SoulBurn"] = false,
-    ["Interface\\Icons\\Spell_Shadow_BlackPlague"] = false,
-    ["Interface\\Icons\\Spell_Shadow_Teleport"] = false,
-    ["Interface\\Icons\\Spell_Nature_AstralRecal"] = false,
-    ["Interface\\Icons\\Spell_Shadow_AntiShadow"] = false,
-    ["Interface\\Icons\\Ability_Vanish"] = false,
-    ["Interface\\Icons\\Ability_Hunter_Pet_Bat"] = false,
-    ["Interface\\Icons\\Spell_Nature_StarFall"] = false,
-    ["Interface\\Icons\\Ability_Warrior_DecisiveStrike"] = false,
-    ["Interface\\Icons\\Spell_Fire_Fireball02"] = false,
-    ["Interface\\Icons\\Spell_Fire_SelfDestruct"] = false,
-    ["Interface\\Icons\\INV_Misc_Bandage_08"] = false,
-    ["Interface\\Icons\\Spell_Frost_FrostArmor"] = false,
-    ["Interface\\Icons\\Ability_WarStomp"] = true,
-    ["Interface\\Icons\\Ability_Hunter_SniperShot"] = false,
-    ["Interface\\Icons\\Spell_Nature_Drowsy"] = true,
-    ["Interface\\Icons\\Ability_Warrior_WarCry"] = false,
-    ["Interface\\Icons\\spell_lacerate_1C"] = false,
-    ["Interface\\Icons\\Spell_Nature_ThunderClap"] = false,
-    ["Interface\\Icons\\Ability_Warrior_SavageBlow"] = false,
-    ["Interface\\Icons\\inv_misc_food_66"] = false,
-    ["Interface\\Icons\\INV_Misc_Head_Dragon_Green"] = false,
-    ["Interface\\Icons\\Spell_Shadow_MindSteal"] = false,
-    ["Interface\\Icons\\Ability_Creature_Disease_03"] = false,
-    ["Interface\\Icons\\Spell_Shadow_CurseOfMannoroth"] = false,
-    ["Interface\\Icons\\Spell_Frost_FrostShock"] = false,
-    ["Interface\\Icons\\Spell_Nature_Brilliance"] = false,
-    ["Interface\\Icons\\Spell_Nature_Polymorph"] = true,
-    ["Interface\\Icons\\Spell_Shadow_SoulLeech_3"] = false,
-    ["Interface\\Icons\\Ability_CriticalStrike"] = false,
-    ["Interface\\Icons\\Spell_Nature_Web"] = true,
-    ["Interface\\Icons\\Spell_Holy_SearingLight"] = false,
-    ["Interface\\Icons\\Ability_Gouge"] = true,
-    ["Interface\\Icons\\Spell_Fire_FlameShock"] = false,
-    ["Interface\\Icons\\Ability_Rogue_KidneyShot"] = true,
-    ["Interface\\Icons\\Spell_Nature_WispSplode"] = false,
-    ["Interface\\Icons\\Ability_Warrior_Sunder"] = false,
-    ["Interface\\Icons\\INV_Mace_02"] = true,
-    ["Interface\\Icons\\INV_Misc_Head_Dragon_Black"] = false,
-    ["Interface\\Icons\\Spell_Shadow_DeadofNight"] = false,
-    ["Interface\\Icons\\Spell_Frost_Glacier"] = true,
-    ["Interface\\Icons\\Ability_Rogue_Disguise"] = false,
-    ["Interface\\Icons\\Spell_Nature_EarthBind"] = true,
-    ["Interface\\Icons\\Spell_Holy_PrayerOfHealing"] = false,
-    ["Interface\\Icons\\Spell_Shadow_RainOfFire"] = false,
-    ["Interface\\Icons\\Ability_Rogue_Trip"] = true,
-    ["Interface\\Icons\\Spell_Shadow_VampiricAura"] = false,
-    ["Interface\\Icons\\Spell_Shadow_MindRot"] = false,
-    ["Interface\\Icons\\Spell_Nature_NaturesWrath"] = false,
-    ["Interface\\Icons\\Spell_Shadow_Haunting"] = false,
-    ["Interface\\Icons\\Spell_Holy_ElunesGrace"] = false,
-    ["Interface\\Icons\\Spell_Fire_FireBolt02"] = false,
-    ["Interface\\Icons\\Spell_Shadow_Charm"] = true,
-    ["Interface\\Icons\\Spell_Arcane_ArcaneResilience"] = false,
-    ["Interface\\Icons\\Ability_BackStab"] = false,
-    ["Interface\\Icons\\Spell_Nature_Sleep"] = true,
-    ["Interface\\Icons\\Ability_ThunderBolt"] = true,
-    ["Interface\\Icons\\Spell_Shadow_AuraOfDarkness"] = false,
-    ["Interface\\Icons\\Spell_Shadow_SiphonMana"] = false,
-    ["Interface\\Icons\\Ability_Devour"] = false,
-    ["Interface\\Icons\\Spell_Frost_FrostNova"] = true,
-    ["Interface\\Icons\\Spell_Holy_Silence"] = false,
-    ["Interface\\Icons\\Spell_Nature_BloodLust"] = false,
-    ["Interface\\Icons\\Spell_Shadow_DarkSummoning"] = false,
-    ["Interface\\Icons\\Ability_GolemThunderClap"] = true,
-    ["Interface\\Icons\\Ability_Racial_Cannibalize"] = false,
-    ["Interface\\Icons\\Spell_Frost_Stun"] = true,
-    ["Interface\\Icons\\Ability_Creature_Poison_05"] = false,
-    ["Interface\\Icons\\Spell_Fire_Fireball"] = false,
-    ["Interface\\Icons\\Spell_Holy_Vindication"] = false,
-    ["Interface\\Icons\\Spell_Shadow_AnimateDead"] = false,
-    ["Interface\\Icons\\Spell_Shadow_Cripple"] = true,
-    ["Interface\\Icons\\Spell_Shadow_CurseOfSargeras"] = false,
-    ["Interface\\Icons\\Spell_Nature_InsectSwarm"] = false,
-    ["Interface\\Icons\\Spell_Nature_Earthquake"] = true,
-    ["Interface\\Icons\\Spell_Shadow_UnholyFrenzy"] = false,
-    ["Interface\\Icons\\Spell_Fire_MeteorStorm"] = false,
-    ["Interface\\Icons\\Ability_BullRush"] = true,
-    ["Interface\\Icons\\Spell_Frost_ChainsOfIce"] = true,
-    ["Interface\\Icons\\Spell_Fire_WindsofWoe"] = false,
-    ["Interface\\Icons\\Ability_PoisonSting"] = false,
-    ["Interface\\Icons\\Ability_Rogue_DeviousPoisons"] = false,
-    ["Interface\\Icons\\INV_Misc_Head_Dragon_Bronze"] = false,
-    ["Interface\\Icons\\Ability_Druid_ChallangingRoar"] = false,
-    ["Interface\\Icons\\Spell_Fire_Fire"] = false,
-    ["Interface\\Icons\\Ability_Druid_Disembowel"] = false,
-    ["Interface\\Icons\\INV_Misc_Fork&Knife"] = false,
-    ["Interface\\Icons\\Spell_Nature_UnyeildingStamina"] = false,
-    ["Interface\\Icons\\Spell_Shadow_Possession"] = true,
-    ["Interface\\Icons\\Spell_Nature_SlowPoison"] = false,
+
+-- Stuns, incapacitates, and mind control effects (hard CC - cannot act)
+RoguePoker.stunTextures = {
+    ["Interface\\Icons\\Ability_Ensnare"]              = true, -- Net/Ensnare stun
+    ["Interface\\Icons\\Spell_Magic_PolymorphPig"]     = true, -- Polymorph (pig)
+    ["Interface\\Icons\\Ability_Sap"]                  = true, -- Sap
+    ["Interface\\Icons\\Ability_Warrior_Charge"]       = true, -- Charge stun
+    ["Interface\\Icons\\Ability_ShockWave"]            = true, -- Shockwave stun
+    ["Interface\\Icons\\Spell_Shadow_DeathScream"]     = true, -- Death Scream fear
+    ["Interface\\Icons\\Ability_CheapShot"]            = true, -- Cheap Shot stun
+    ["Interface\\Icons\\Ability_WarStomp"]             = true, -- War Stomp stun
+    ["Interface\\Icons\\Spell_Nature_Drowsy"]          = true, -- Drowsy (sleep)
+    ["Interface\\Icons\\Spell_Nature_Polymorph"]       = true, -- Polymorph (sheep)
+    ["Interface\\Icons\\Ability_Gouge"]                = true, -- Gouge incapacitate
+    ["Interface\\Icons\\Ability_Rogue_KidneyShot"]     = true, -- Kidney Shot stun
+    ["Interface\\Icons\\INV_Mace_02"]                  = true, -- Blackjack stun
+    ["Interface\\Icons\\Spell_Shadow_Charm"]           = true, -- Charm/MC
+    ["Interface\\Icons\\Spell_Nature_Sleep"]           = true, -- Sleep
+    ["Interface\\Icons\\Ability_ThunderBolt"]          = true, -- Thunderbolt stun
+    ["Interface\\Icons\\Spell_Frost_Stun"]             = true, -- Frost stun
+    ["Interface\\Icons\\Ability_GolemThunderClap"]     = true, -- Golem Thunderclap stun
+    ["Interface\\Icons\\Spell_Shadow_Possession"]      = true, -- Possession (mind control)
+    ["Interface\\Icons\\Spell_Shadow_PsychicScream"]   = true, -- Psychic Scream fear
+    ["Interface\\Icons\\Spell_Frost_Glacier"]          = true, -- Glacier stun
+    ["Interface\\Icons\\Spell_Holy_RighteousnessAura"] = true, -- Hammer of Justice (paladin stun)
+    ["Interface\\Icons\\Spell_Shadow_ShadowWordDominate"] = true, -- Shadow Word: Dominate (mind control)
 }
 
-function RoguePoker:IsBadStatus()
+-- Severe movement impairing effects (roots and heavy slows)
+RoguePoker.movementTextures = {
+    ["Interface\\Icons\\Spell_Nature_Slow"]            = true, -- Slow
+    ["Interface\\Icons\\Spell_Nature_StrangleVines"]   = true, -- Entangling Roots
+    ["Interface\\Icons\\Spell_Nature_Web"]             = true, -- Web root
+    ["Interface\\Icons\\Spell_Nature_EarthBind"]       = true, -- Earthbind root
+    ["Interface\\Icons\\Ability_Rogue_Trip"]           = true, -- Trip root
+    ["Interface\\Icons\\Spell_Shadow_Cripple"]         = true, -- Cripple slow
+    ["Interface\\Icons\\Spell_Nature_Earthquake"]      = true, -- Earthquake root
+    ["Interface\\Icons\\Ability_BullRush"]             = true, -- Bull Rush root
+    ["Interface\\Icons\\Spell_Frost_ChainsOfIce"]      = true, -- Chains of Ice root
+    ["Interface\\Icons\\Spell_Frost_FrostNova"]        = true, -- Frost Nova root
+    ["Interface\\Icons\\Spell_Frost_ChillingBlast"]    = true, -- Chilling Blast slow/root
+    ["Interface\\Icons\\Ability_Hunter_Quickshot"]     = true, -- Concussive Shot / Wing Clip slow
+}
+
+function RoguePoker:IsBadStatusForInsignia()
+	local db = RoguePokerDB
 	local i = 1
 	while true do
 		local texture = UnitDebuff("player", i)
 		if not texture then break end
-		if RoguePoker.badTextures[texture] then return true end
+		if db.useInsigniaStuns    and RoguePoker.stunTextures[texture]     then return true end
+		if db.useInsigniaMovement and RoguePoker.movementTextures[texture] then return true end
+		i = i + 1
+	end
+	return false
+end
+
+function RoguePoker:IsBadStatusForSprint()
+	local db = RoguePokerDB
+	local i = 1
+	while true do
+		local texture = UnitDebuff("player", i)
+		if not texture then break end
+		if RoguePoker.movementTextures[texture] then return true end
 		i = i + 1
 	end
 	return false
@@ -565,6 +535,7 @@ function RoguePoker:Rota()
 	end
 
 	local mobTargetsMe = (not UnitIsPlayer("target")) and RoguePoker:IsMyTargetTargetingMe()
+	local inMeleeCombat = mobTargetsMe or db.tankMode
 
 	RoguePoker:AutoAttack()
 	if not db.pvpMode then
@@ -572,10 +543,26 @@ function RoguePoker:Rota()
 	end
 	RoguePoker:AutoAssistTarget()
 
-	-- Insignia on bad status
-	if db.useInsignia and RoguePoker:IsBadStatus() then
+	-- Insignia CC break on bad status
+	if db.useInsignia and RoguePoker:IsBadStatusForInsignia() then
 		RoguePoker:UseInsignia()
 		return
+	end
+
+	-- Sprint movement impair break (Improved Sprint rank 2 required)
+	if db.useSprintMovement and RoguePoker:IsBadStatusForSprint() then
+		local _, _, _, _, improvedSprintRank = GetTalentInfo(2, 7)
+		if improvedSprintRank and improvedSprintRank == 2 then
+			local sprintSid = RoguePoker:FindSpellid("Sprint")
+			if sprintSid > 0 then
+				local start, duration = GetSpellCooldown(sprintSid, BOOKTYPE_SPELL)
+				local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
+				if not onCooldown then
+					CastSpellByName("Sprint")
+					return
+				end
+			end
+		end
 	end
 
 	-- ---- Always Feint (threat reduction, not in tank mode) ----
@@ -589,7 +576,7 @@ function RoguePoker:Rota()
 			if sid > 0 then
 				local _, dur = GetSpellCooldown(sid, BOOKTYPE_SPELL)
 				if dur == 0 and not RoguePoker:ShouldWait("Feint") then
-					CastSpellByName("Feint")
+					RoguePoker:QueueOrCast("Feint")
 					return
 				end
 			end
@@ -598,7 +585,20 @@ function RoguePoker:Rota()
 
 
 	-- ---- Evasion / Tank abilities ----
-	if mobTargetsMe or db.tankMode then
+	if inMeleeCombat then
+		-- Clear pending tracker if the buff has appeared or it's been > 2s
+		if RoguePoker.defensivePending then
+			local elapsed = RoguePoker.defensivePendingTime and (GetTime() - RoguePoker.defensivePendingTime) or 0
+			local buffApplied = RoguePoker:IsActive(RoguePoker.defensivePending)
+			if buffApplied or elapsed > 2 then
+				RoguePoker.defensivePending = nil
+				RoguePoker.defensivePendingTime = nil
+			else
+				-- A defensive ability was just queued, skip this block entirely
+				return
+			end
+		end
+
 		for _, ev in ipairs(db.evasion) do
 			if ev.enabled then
 				local name = ev.name
@@ -609,7 +609,7 @@ function RoguePoker:Rota()
 					-- Feint: cast whenever off cooldown
 					if name == "Feint" then
 						if dur == 0 and not RoguePoker:ShouldWait(name) then
-							CastSpellByName(name)
+							RoguePoker:QueueOrCast(name)
 							return
 						end
 
@@ -620,50 +620,71 @@ function RoguePoker:Rota()
 						local phPct = (phMax > 0) and (100 * ph / phMax) or 100
 						local threshold = ev.healthPct or 20
 						if dur == 0 and phPct < threshold then
-							CastSpellByName(name)
+							RoguePoker:QueueOrCast(name)
 							return
 						end
 
-					-- Evasion: only below configured health threshold, not if GS/Flourish active
+					-- Evasion: only below configured health threshold, not if GS/Flourish active or pending
+					-- Also only fires if all enabled higher-priority defensives (GS/Flourish) are on cooldown
 					elseif name == "Evasion" then
 						local ph = UnitHealth("player")
 						local phMax = UnitHealthMax("player")
 						local phPct = (phMax > 0) and (100 * ph / phMax) or 100
 						local threshold = ev.healthPct or 50
 						local active, timeLeft = RoguePoker:IsActive(name)
-						-- Don't override Ghostly Strike or Flourish if still active > 2s
+						-- Don't fire if another defensive was recently queued
+						local otherPending = RoguePoker.defensivePending and RoguePoker.defensivePending ~= name
+						-- Don't override Ghostly Strike or Flourish if still active > 0.5s
 						local otherActive = false
 						for _, ev2 in ipairs(db.evasion) do
 							if ev2.name ~= "Feint" and ev2.name ~= "Vanish" and ev2.name ~= "Evasion" then
 								local a, t = RoguePoker:IsActive(ev2.name)
-								if a and t > 2 then otherActive = true break end
+								if a and t > 0.5 then otherActive = true break end
 							end
 						end
-						if dur == 0 and phPct < threshold and not otherActive and (not active or timeLeft <= 2) then
-							CastSpellByName(name)
+						-- Only fire if all enabled GS/Flourish are on cooldown
+						local higherPriorityAvailable = false
+						for _, ev2 in ipairs(db.evasion) do
+							if ev2.enabled and ev2.name ~= "Feint" and ev2.name ~= "Vanish" and ev2.name ~= "Evasion" then
+								local sid2 = RoguePoker:FindSpellid(ev2.name)
+								if sid2 > 0 then
+									local s2, d2 = GetSpellCooldown(sid2, BOOKTYPE_SPELL)
+									local notOnCooldown = not (d2 and d2 > 0 and (s2 + d2) > GetTime())
+									if notOnCooldown then
+										higherPriorityAvailable = true
+										break
+									end
+								end
+							end
+						end
+						if dur == 0 and phPct <= threshold and not otherActive and not otherPending and not higherPriorityAvailable and (not active or timeLeft <= 0.5) then
+							RoguePoker.defensivePending = name
+							RoguePoker.defensivePendingTime = GetTime()
+							RoguePoker:QueueOrCast(name)
 							return
 						end
 
-					-- Ghostly Strike / Flourish: one-buff-at-a-time rule with Evasion
+					-- Ghostly Strike / Flourish: only one of GS/Flourish/Evasion active at a time
+					-- Allow casting when the current active buff drops to <= 0.5s remaining
 					else
-						-- Check if any evasion buff (including Evasion itself) is already active > 2s
-						local buffActive = false
+						local active, timeLeft = RoguePoker:IsActive(name)
+						local otherBuffActive = false
+						local otherPending = RoguePoker.defensivePending and RoguePoker.defensivePending ~= name
 						for _, ev2 in ipairs(db.evasion) do
-							if ev2.name ~= "Feint" and ev2.name ~= "Vanish" then
+							if ev2.name ~= "Feint" and ev2.name ~= "Vanish" and ev2.name ~= name then
 								local a, t = RoguePoker:IsActive(ev2.name)
-								if a and t > 2 then buffActive = true break end
+								if a and t > 0.5 then otherBuffActive = true break end
 							end
 						end
-						if not buffActive then
-							local active, timeLeft = RoguePoker:IsActive(name)
-							local needsCP = (name == "Flourish")
-							if dur == 0 and (not active or timeLeft <= 2) then
-								if not needsCP or cP > 0 then
-									if not RoguePoker:ShouldWait(name) then
-										CastSpellByName(name)
-										return
-									end
-								end
+						local needsCP = (name == "Flourish")
+						local start, duration = GetSpellCooldown(sid, BOOKTYPE_SPELL)
+						local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
+						if not onCooldown and not otherBuffActive and not otherPending and (not active or timeLeft <= 0.5) then
+							if not needsCP or cP > 0 then
+								RoguePoker.defensivePending = name
+								RoguePoker.defensivePendingTime = GetTime()
+								RoguePoker:QueueOrCast(name)
+								return
 							end
 						end
 					end
@@ -701,10 +722,10 @@ function RoguePoker:Rota()
 					if sodAvailable then
 						RoguePoker.shadowOfDeathPending = true
 						RoguePoker.shadowOfDeathPendingTime = GetTime()
-						CastSpellByName("Mark for Death")
+						RoguePoker:QueueOrCast("Mark for Death")
 						return
 					elseif not sodEnabled or not sodKnown then
-						CastSpellByName("Mark for Death")
+						RoguePoker:QueueOrCast("Mark for Death")
 						return
 					end
 				end
@@ -725,7 +746,7 @@ function RoguePoker:Rota()
 				if sodDur == 0 and not RoguePoker:ShouldWait("Shadow of Death") then
 					RoguePoker.shadowOfDeathPending = false
 					RoguePoker.shadowOfDeathPendingTime = nil
-					CastSpellByName("Shadow of Death")
+					RoguePoker:QueueOrCast("Shadow of Death")
 					return
 				end
 			else
@@ -740,7 +761,7 @@ function RoguePoker:Rota()
 	for _, fin in ipairs(db.finishers) do
 		if fin.enabled then
 			local name = fin.name
-			local kind = fin.kind or "damage"
+				local kind = fin.kind or "damage"
 			local minCP = fin.minCP or 1
 
 			-- Conditional abilities: no CP requirement, fire when available
@@ -751,39 +772,23 @@ function RoguePoker:Rota()
 				else
 				local sid = RoguePoker:FindSpellid(name)
 				if sid > 0 then
-					local _, dur = GetSpellCooldown(sid, BOOKTYPE_SPELL)
-					local canFire = dur == 0
-					-- Surprise Attack only fires when dodge proc is active
-					if name == "Surprise Attack" then
-						-- Expire the proc if more than 3s have passed since the dodge
-						if RoguePoker.surpriseAttackTime and (GetTime() - RoguePoker.surpriseAttackTime) > 3 then
-							RoguePoker.surpriseAttackReady = false
-							RoguePoker.surpriseAttackTime = nil
+					local canFire = false
+					if name == "Surprise Attack" or name == "Riposte" then
+						-- Use nampower's IsSpellUsable to detect proc availability
+						-- Returns 1 only when the proc is active (dodge for SA, parry for Riposte)
+						if IsSpellUsable then
+							local procReady = IsSpellUsable(name) == 1
+							local start, duration = GetSpellCooldown(sid, BOOKTYPE_SPELL)
+							local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
+							canFire = procReady and not onCooldown
 						end
+					else
 						local start, duration = GetSpellCooldown(sid, BOOKTYPE_SPELL)
-						local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
-						canFire = RoguePoker.surpriseAttackReady and not onCooldown
-					end
-					-- Riposte only fires when parry proc is active
-					if name == "Riposte" then
-						if RoguePoker.riposteTime and (GetTime() - RoguePoker.riposteTime) > 3 then
-							RoguePoker.riposteReady = false
-							RoguePoker.riposteTime = nil
-						end
-						local start, duration = GetSpellCooldown(sid, BOOKTYPE_SPELL)
-						local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
-						canFire = RoguePoker.riposteReady and not onCooldown
+						canFire = not (duration and duration > 0 and (start + duration) > GetTime())
 					end
 					if canFire then
 						if not RoguePoker:ShouldWait(name) then
-							if name == "Surprise Attack" then
-								RoguePoker.surpriseAttackReady = false
-								RoguePoker.surpriseAttackTime = nil
-							elseif name == "Riposte" then
-								RoguePoker.riposteReady = false
-								RoguePoker.riposteTime = nil
-							end
-							CastSpellByName(name)
+							RoguePoker:QueueOrCast(name)
 							return
 						end
 					end
@@ -823,7 +828,7 @@ function RoguePoker:Rota()
 				if kind == "buff" then
 					local needsRefresh = (not active) or (active and timeLeft > 0.5 and timeLeft < 2)
 					if needsRefresh and not RoguePoker:ShouldWait(name) then
-						CastSpellByName(name)
+						RoguePoker:QueueOrCast(name)
 						return
 					end
 
@@ -833,13 +838,13 @@ function RoguePoker:Rota()
 						if name == "Expose Armor" then
 							RoguePoker:TrackDebuff("Expose Armor", 30)
 						end
-						CastSpellByName(name)
+						RoguePoker:QueueOrCast(name)
 						return
 					end
 
 				else -- damage
 					if not RoguePoker:ShouldWait(name) then
-						CastSpellByName(name)
+						RoguePoker:QueueOrCast(name)
 						return
 					end
 				end
@@ -851,14 +856,21 @@ function RoguePoker:Rota()
 	-- ---- Combo Builder ----
 	local builder = db.comboBuilder or "Sinister Strike"
 
-	-- Backstab requires being behind the target - fall back to Sinister Strike
-	if builder == "Backstab" and mobTargetsMe then
-		builder = "Sinister Strike"
+	-- Backstab requires being behind the target
+	-- Fall back to Sinister Strike if mob is targeting us, or if we recently
+	-- got a "must be behind your target" error from a failed Backstab attempt
+	if builder == "Backstab" then
+		-- Expire the not-behind flag after 3 seconds
+		if RoguePoker.notBehindTime and (GetTime() - RoguePoker.notBehindTime) > 3 then
+			RoguePoker.notBehindTarget = false
+			RoguePoker.notBehindTime = nil
+		end
+		if mobTargetsMe or RoguePoker.notBehindTarget then
+			builder = "Sinister Strike"
+		end
 	end
 
-	if not RoguePoker:ShouldWait(builder) then
-		CastSpellByName(builder)
-	end
+	RoguePoker:QueueOrCast(builder)
 end
 
 -- ==========================================
@@ -905,7 +917,7 @@ function RoguePoker:Interrupt()
 							local _, dur = GetSpellCooldown(sid, BOOKTYPE_SPELL)
 							if dur == 0 then
 								if not RoguePoker:ShouldWait(castName) then
-									CastSpellByName(castName)
+									RoguePoker:QueueOrCast(castName)
 									return
 								end
 							end
@@ -917,7 +929,7 @@ function RoguePoker:Interrupt()
 						local _, dur = GetSpellCooldown(sid, BOOKTYPE_SPELL)
 						if dur == 0 then
 							if not RoguePoker:ShouldWait(castName) then
-								CastSpellByName(castName)
+								RoguePoker:QueueOrCast(castName)
 								return
 							end
 						end
@@ -925,42 +937,6 @@ function RoguePoker:Interrupt()
 				end
 			end
 		end
-	end
-end
-
--- ==========================================
--- Debug Helpers
--- ==========================================
-function RoguePoker:DebugBuffs()
-	for i = 0, 31 do
-		local buffIndex = GetPlayerBuff(i, "HELPFUL")
-		if buffIndex < 0 then break end
-		local timeLeft = GetPlayerBuffTimeLeft(buffIndex)
-		print("Buff " .. i .. " index:" .. buffIndex .. " timeLeft:" .. tostring(timeLeft))
-	end
-	local sdActive, sdTime = RoguePoker:IsActive("Slice and Dice")
-	local eActive, eTime   = RoguePoker:IsActive("Envenom")
-	print("SD active:" .. tostring(sdActive) .. " time:" .. tostring(sdTime))
-	print("Envenom active:" .. tostring(eActive) .. " time:" .. tostring(eTime))
-end
-
-function RoguePoker:DebugDebuffs()
-	local i = 1
-	while true do
-		local a, b, c, d, e = UnitDebuff("player", i)
-		if not a then break end
-		if not RoguePoker.badTextures[a] then
-			print("Debuff " .. i .. ": " .. tostring(a))
-		end
-		i = i + 1
-	end
-end
-
-function RoguePoker:PrintSpellid()
-	for i = 1, 200 do
-		local name, rank = GetSpellName(i, BOOKTYPE_SPELL)
-		if not name then break end
-		print(i, name, rank)
 	end
 end
 
@@ -1477,37 +1453,91 @@ local alwaysFeintCB, _ = MakeCheckbox(tab3Panel, "Always Feint (reduces threat)"
 	function() return RoguePokerDB and RoguePokerDB.alwaysFeint end,
 	function(v) if RoguePokerDB then RoguePokerDB.alwaysFeint = v end end)
 
-local insigniaCB, _ = MakeCheckbox(tab3Panel, "Use Insignia when stunned", 10, -50,
+local insigniaCB, _ = MakeCheckbox(tab3Panel, "Use Insignia on CC", 10, -50,
 	function() return RoguePokerDB and RoguePokerDB.useInsignia end,
 	function(v) if RoguePokerDB then RoguePokerDB.useInsignia = v end end)
 
-local pvpModeCB, _ = MakeCheckbox(tab3Panel, "PvP Mode (disables Assist)", 10, -72,
+-- Sub-option: Stuns & Mind Control (indented, greyed when parent disabled)
+local insigniaStunsCB = CreateFrame("CheckButton", nil, tab3Panel, "UICheckButtonTemplate")
+insigniaStunsCB:SetWidth(20)
+insigniaStunsCB:SetHeight(20)
+insigniaStunsCB:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 30, -68)
+local insigniaStunsCBLabel = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+insigniaStunsCBLabel:SetPoint("LEFT", insigniaStunsCB, "RIGHT", 2, 0)
+insigniaStunsCBLabel:SetText("Stuns & Mind Control")
+insigniaStunsCB:SetScript("OnClick", function()
+	if RoguePokerDB and RoguePokerDB.useInsignia then
+		RoguePokerDB.useInsigniaStuns = (insigniaStunsCB:GetChecked() == 1)
+	else
+		insigniaStunsCB:SetChecked(RoguePokerDB and RoguePokerDB.useInsigniaStuns)
+	end
+end)
+
+-- Sub-option: Movement Impairing Effects (indented, greyed when parent disabled)
+local insigniaMovementCB = CreateFrame("CheckButton", nil, tab3Panel, "UICheckButtonTemplate")
+insigniaMovementCB:SetWidth(20)
+insigniaMovementCB:SetHeight(20)
+insigniaMovementCB:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 30, -86)
+local insigniaMovementCBLabel = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+insigniaMovementCBLabel:SetPoint("LEFT", insigniaMovementCB, "RIGHT", 2, 0)
+insigniaMovementCBLabel:SetText("Movement Impairing Effects")
+insigniaMovementCB:SetScript("OnClick", function()
+	if RoguePokerDB and RoguePokerDB.useInsignia then
+		RoguePokerDB.useInsigniaMovement = (insigniaMovementCB:GetChecked() == 1)
+	else
+		insigniaMovementCB:SetChecked(RoguePokerDB and RoguePokerDB.useInsigniaMovement)
+	end
+end)
+
+-- Helper to update sub-option visual state based on parent
+local function UpdateInsigniaSubOptions()
+	local enabled = RoguePokerDB and RoguePokerDB.useInsignia
+	local alpha = enabled and 1.0 or 0.4
+	insigniaStunsCB:SetAlpha(alpha)
+	insigniaStunsCBLabel:SetAlpha(alpha)
+	insigniaMovementCB:SetAlpha(alpha)
+	insigniaMovementCBLabel:SetAlpha(alpha)
+end
+
+-- Override insigniaCB click to also update sub-option states
+insigniaCB:SetScript("OnClick", function()
+	if RoguePokerDB then
+		RoguePokerDB.useInsignia = (insigniaCB:GetChecked() == 1)
+		UpdateInsigniaSubOptions()
+	end
+end)
+
+local sprintMovementCB, _ = MakeCheckbox(tab3Panel, "Use Sprint on Movement Impairing Effects", 10, -108,
+	function() return RoguePokerDB and RoguePokerDB.useSprintMovement end,
+	function(v) if RoguePokerDB then RoguePokerDB.useSprintMovement = v end end)
+
+local pvpModeCB, _ = MakeCheckbox(tab3Panel, "PvP Mode (disables Assist)", 10, -130,
 	function() return RoguePokerDB and RoguePokerDB.pvpMode end,
 	function(v) if RoguePokerDB then RoguePokerDB.pvpMode = v end end)
 
-local tankModeCB, _ = MakeCheckbox(tab3Panel, "Tank Mode", 10, -94,
+local tankModeCB, _ = MakeCheckbox(tab3Panel, "Tank Mode", 10, -152,
 	function() return RoguePokerDB and RoguePokerDB.tankMode end,
 	function(v) if RoguePokerDB then RoguePokerDB.tankMode = v end end)
 
 -- ---- Auto Assist ----
 local assistSep = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-assistSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -120)
+assistSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -178)
 assistSep:SetText("------------------------------")
 assistSep:SetTextColor(0.4, 0.4, 0.4)
 
-local autoAssistCB, _ = MakeCheckbox(tab3Panel, "Auto Assist", 10, -136,
+local autoAssistCB, _ = MakeCheckbox(tab3Panel, "Auto Assist", 10, -194,
 	function() return RoguePokerDB and RoguePokerDB.autoAssist end,
 	function(v) if RoguePokerDB then RoguePokerDB.autoAssist = v end end)
 
 local assistNote = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-assistNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -160)
+assistNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -216)
 assistNote:SetText("When enabled and you have no target, assist this player:")
 assistNote:SetTextColor(0.7, 0.7, 0.7)
 
 local assistEditBox = CreateFrame("EditBox", "RoguePokerAssistEditBox", tab3Panel, "InputBoxTemplate")
 assistEditBox:SetWidth(200)
 assistEditBox:SetHeight(20)
-assistEditBox:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 14, -178)
+assistEditBox:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 14, -234)
 assistEditBox:SetAutoFocus(false)
 assistEditBox:SetMaxLetters(64)
 assistEditBox:SetText("")
@@ -1561,19 +1591,19 @@ end)
 
 -- ---- Auto Attack Setup ----
 local attackSep = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-attackSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -210)
+attackSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -276)
 attackSep:SetText("------------------------------")
 attackSep:SetTextColor(0.4, 0.4, 0.4)
 
 local attackNote = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-attackNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -224)
+attackNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -290)
 attackNote:SetText("Required for auto-attack detection (places Attack into slot 72):")
 attackNote:SetTextColor(0.7, 0.7, 0.7)
 
 local setupAttackBtn = CreateFrame("Button", nil, tab3Panel, "UIPanelButtonTemplate")
 setupAttackBtn:SetWidth(130)
 setupAttackBtn:SetHeight(22)
-setupAttackBtn:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -242)
+setupAttackBtn:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -308)
 setupAttackBtn:SetText("Setup Auto Attack")
 setupAttackBtn:SetScript("OnClick", function()
 	-- Find the Attack spell in the spellbook and place it into action slot 72
@@ -1645,6 +1675,10 @@ function RoguePoker:ScanAndRebuild()
 	-- Restore option checkboxes
 	alwaysFeintCB:SetChecked(db.alwaysFeint)
 	insigniaCB:SetChecked(db.useInsignia)
+	insigniaStunsCB:SetChecked(db.useInsigniaStuns)
+	insigniaMovementCB:SetChecked(db.useInsigniaMovement)
+	UpdateInsigniaSubOptions()
+	sprintMovementCB:SetChecked(db.useSprintMovement)
 	tankModeCB:SetChecked(db.tankMode)
 	pvpModeCB:SetChecked(db.pvpMode)
 	autoAssistCB:SetChecked(db.autoAssist)
@@ -1656,7 +1690,7 @@ end
 -- ==========================================
 local versionLabel = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 versionLabel:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOMRIGHT", -8, 8)
-versionLabel:SetText("v1.1.8")
+versionLabel:SetText("v1.2.0")
 versionLabel:SetTextColor(0.5, 0.5, 0.5)
 
 -- ==========================================
@@ -1703,65 +1737,29 @@ loadFrame:RegisterEvent("VARIABLES_LOADED")
 loadFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 loadFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 loadFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
-loadFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
-loadFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
-loadFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS")
-loadFrame:RegisterEvent("CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF")
-loadFrame:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
-loadFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES")
+loadFrame:RegisterEvent("UI_ERROR_MESSAGE")
 loadFrame:SetScript("OnEvent", function()
 	if event == "PLAYER_REGEN_DISABLED" then
-		RoguePoker.surpriseAttackReady = false
-		RoguePoker.surpriseAttackTime = nil
-		RoguePoker.riposteReady = false
-		RoguePoker.riposteTime = nil
+		RoguePoker.inCombat = true
 		RoguePoker.shadowOfDeathPending = false
 		RoguePoker.shadowOfDeathPendingTime = nil
+		RoguePoker.defensivePending = nil
+		RoguePoker.defensivePendingTime = nil
+		RoguePoker.notBehindTarget = false
+		RoguePoker.notBehindTime = nil
 	elseif event == "PLAYER_REGEN_ENABLED" then
-		RoguePoker.surpriseAttackReady = false
-		RoguePoker.surpriseAttackTime = nil
-		RoguePoker.riposteReady = false
-		RoguePoker.riposteTime = nil
+		RoguePoker.inCombat = false
 		RoguePoker.shadowOfDeathPending = false
 		RoguePoker.shadowOfDeathPendingTime = nil
+		RoguePoker.defensivePending = nil
+		RoguePoker.defensivePendingTime = nil
+		RoguePoker.notBehindTarget = false
+		RoguePoker.notBehindTime = nil
 		RoguePoker.debuffExpiry = {}
-	elseif event == "CHAT_MSG_COMBAT_SELF_MISSES" then
-		if arg1 and string.find(arg1, "dodge") then
-			RoguePoker.surpriseAttackReady = true
-			RoguePoker.surpriseAttackTime = GetTime()
-		end
-		if arg1 and string.find(arg1, "You parry") then
-			RoguePoker.riposteReady = true
-			RoguePoker.riposteTime = GetTime()
-		end
-	elseif event == "CHAT_MSG_SPELL_SELF_DAMAGE" then
-		if arg1 and string.find(arg1, "dodge") then
-			RoguePoker.surpriseAttackReady = true
-			RoguePoker.surpriseAttackTime = GetTime()
-		end
-		if arg1 and string.find(arg1, "You parry") then
-			RoguePoker.riposteReady = true
-			RoguePoker.riposteTime = GetTime()
-		end
-	elseif event == "CHAT_MSG_COMBAT_SELF_HITS" then
-		if arg1 and string.find(arg1, "You parry") then
-			RoguePoker.riposteReady = true
-			RoguePoker.riposteTime = GetTime()
-		end
-	elseif event == "CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF" then
-		if arg1 and string.find(arg1, "You parry") then
-			RoguePoker.riposteReady = true
-			RoguePoker.riposteTime = GetTime()
-		end
-	elseif event == "CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES" then
-		if arg1 and string.find(arg1, "You parry") then
-			RoguePoker.riposteReady = true
-			RoguePoker.riposteTime = GetTime()
-		end
-	elseif event == "CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES" then
-		if arg1 and string.find(arg1, "You parry") then
-			RoguePoker.riposteReady = true
-			RoguePoker.riposteTime = GetTime()
+	elseif event == "UI_ERROR_MESSAGE" then
+		if arg1 and string.find(arg1, "behind") then
+			RoguePoker.notBehindTarget = true
+			RoguePoker.notBehindTime = GetTime()
 		end
 	elseif event == "VARIABLES_LOADED" then
 		InitDB()
@@ -1785,6 +1783,10 @@ loadFrame:SetScript("OnEvent", function()
 		RefreshInterruptRows()
 		alwaysFeintCB:SetChecked(RoguePokerDB.alwaysFeint)
 		insigniaCB:SetChecked(RoguePokerDB.useInsignia)
+		insigniaStunsCB:SetChecked(RoguePokerDB.useInsigniaStuns)
+		insigniaMovementCB:SetChecked(RoguePokerDB.useInsigniaMovement)
+		UpdateInsigniaSubOptions()
+		sprintMovementCB:SetChecked(RoguePokerDB.useSprintMovement)
 		tankModeCB:SetChecked(RoguePokerDB.tankMode)
 		pvpModeCB:SetChecked(RoguePokerDB.pvpMode)
 		autoAssistCB:SetChecked(RoguePokerDB.autoAssist)
@@ -1828,6 +1830,45 @@ SlashCmdList["RPASSIST"] = function()
 	RoguePoker:AssistNamedPlayer()
 end
 
+function RoguePoker:DumpDebuffs()
+	if not WriteCustomFile then
+		print("|cFFFFD700RoguePoker|r: WriteCustomFile not available (nampower not loaded?)")
+		return
+	end
+	local lines = {}
+	local timestamp = date("%Y-%m-%d %H:%M:%S")
+	table.insert(lines, "RoguePoker Debuff Dump - " .. timestamp)
+	table.insert(lines, "----------------------------------------")
+	local i = 1
+	local count = 0
+	while true do
+		local texture = UnitDebuff("player", i)
+		if not texture then break end
+		local inStuns     = RoguePoker.stunTextures[texture]     and "STUN"     or ""
+		local inMovement  = RoguePoker.movementTextures[texture] and "MOVEMENT" or ""
+		local category = (inStuns ~= "" and inStuns) or (inMovement ~= "" and inMovement) or "UNCATEGORIZED"
+		table.insert(lines, "[" .. category .. "] " .. texture)
+		count = count + 1
+		i = i + 1
+	end
+	if count == 0 then
+		table.insert(lines, "(no debuffs active)")
+	end
+	table.insert(lines, "----------------------------------------")
+	table.insert(lines, "Total: " .. count .. " debuffs")
+	local content = ""
+	for _, line in ipairs(lines) do
+		content = content .. line .. "\n"
+	end
+	WriteCustomFile("RoguePokerDebuffs.txt", content, "a")
+	print("|cFFFFD700RoguePoker|r: " .. count .. " debuffs written to CustomData/RoguePokerDebuffs.txt")
+end
+
+SLASH_RPDUMP1 = "/rpdump"
+SlashCmdList["RPDUMP"] = function()
+	RoguePoker:DumpDebuffs()
+end
+
 SLASH_RPCHECK1 = "/rpcheck"
 SlashCmdList["RPCHECK"] = function(msg)
 	print("RP CHECK: target debuffs:")
@@ -1835,46 +1876,5 @@ SlashCmdList["RPCHECK"] = function(msg)
 		local texture = UnitDebuff("target", i)
 		if not texture then break end
 		print("RP CHECK: slot "..tostring(i).." texture="..tostring(texture))
-	end
-end
-
--- ==========================================
--- Parry Debug Sniffer  (/rpsniff on | /rpsniff off)
--- ==========================================
-local rpSniffFrame = CreateFrame("Frame")
-local rpSniffActive = false
-
-rpSniffFrame:SetScript("OnEvent", function()
-	if not rpSniffActive then return end
-	if arg1 and string.find(arg1, "You parry") then
-		DEFAULT_CHAT_FRAME:AddMessage("|cFFFF6600RPSNIFF|r ["..tostring(event).."] "..tostring(arg1))
-	end
-end)
-
-SLASH_RPSNIFF1 = "/rpsniff"
-SlashCmdList["RPSNIFF"] = function(msg)
-	if msg == "on" then
-		rpSniffActive = true
-		-- Incoming attack events (mob/player attacks you)
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_SELF_MISSES")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_DAMAGESHIELDS_ON_SELF")
-		-- Also keep these as fallback
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_MISSES")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_SELF_BUFF")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_SELF_BUFFS")
-		-- Outgoing miss events (your attack result)
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_MISSES")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_MISSES")
-		rpSniffFrame:RegisterEvent("CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE")
-		print("|cFFFFD700RoguePoker|r: Parry sniffer ON. Fight something and let it hit you. Only 'You parry' messages shown.")
-	elseif msg == "off" then
-		rpSniffActive = false
-		rpSniffFrame:UnregisterAllEvents()
-		print("|cFFFFD700RoguePoker|r: Parry sniffer OFF.")
-	else
-		print("|cFFFFD700RoguePoker|r: Usage: /rpsniff on  or  /rpsniff off")
 	end
 end
