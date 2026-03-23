@@ -156,6 +156,7 @@ local defaults = {
 	useInsigniaStuns    = true,
 	useInsigniaMovement = true,
 	useSprintMovement   = true,
+	showBuilderBar      = false,
 	alwaysFeint     = false,
 	tankMode        = false,
 	pvpMode         = false,
@@ -219,6 +220,7 @@ local function InitDB()
 	if RoguePokerDB.useInsigniaStuns   == nil then RoguePokerDB.useInsigniaStuns   = defaults.useInsigniaStuns   end
 	if RoguePokerDB.useInsigniaMovement == nil then RoguePokerDB.useInsigniaMovement = defaults.useInsigniaMovement end
 	if RoguePokerDB.useSprintMovement  == nil then RoguePokerDB.useSprintMovement  = defaults.useSprintMovement  end
+	if RoguePokerDB.showBuilderBar     == nil then RoguePokerDB.showBuilderBar     = defaults.showBuilderBar     end
 	if RoguePokerDB.alwaysFeint   == nil then RoguePokerDB.alwaysFeint   = defaults.alwaysFeint   end
 	if RoguePokerDB.tankMode      == nil then RoguePokerDB.tankMode      = defaults.tankMode      end
 	if RoguePokerDB.pvpMode       == nil then RoguePokerDB.pvpMode       = defaults.pvpMode       end
@@ -511,6 +513,67 @@ function RoguePoker:UseInsignia()
 end
 
 -- ==========================================
+-- Reactive Item Use
+-- ==========================================
+
+-- Items to use whenever the player has a specific debuff texture.
+-- Each entry: { itemName, debuffTexture }
+-- The item fires every time the debuff is present and the item is off cooldown.
+-- Add more entries here to handle additional items/debuffs.
+RoguePoker.reactiveItems = {
+	{ itemName = "Hourglass Sand", debuffTexture = "Interface\\Icons\\INV_Misc_Head_Dragon_Bronze" },
+}
+
+-- Searches all bags (0-4) for an item by name and returns bag, slot.
+function RoguePoker:FindItemInBags(itemName)
+	for bag = 0, 4 do
+		local slots = GetContainerNumSlots(bag)
+		if slots then
+			for slot = 1, slots do
+				local link = GetContainerItemLink(bag, slot)
+				if link and string.find(link, itemName) then
+					return bag, slot
+				end
+			end
+		end
+	end
+	return nil, nil
+end
+
+-- Checks each reactive item entry and fires the item if:
+--   1. The player currently has the trigger debuff.
+--   2. The item is in bags, has charges, and is off cooldown.
+-- Safe to call every Rota() tick -- cooldown check prevents spam.
+function RoguePoker:UseReactiveItems()
+	local activeTextures = {}
+	local i = 1
+	while true do
+		local texture = UnitDebuff("player", i)
+		if not texture then break end
+		activeTextures[texture] = true
+		i = i + 1
+	end
+
+	for _, entry in ipairs(RoguePoker.reactiveItems) do
+		if activeTextures[entry.debuffTexture] then
+			local bag, slot = RoguePoker:FindItemInBags(entry.itemName)
+			if bag then
+				local _, count = GetContainerItemInfo(bag, slot)
+				if count and count > 0 then
+					local start, duration = GetContainerItemCooldown(bag, slot)
+					local onCooldown = duration and duration > 0 and (start + duration) > GetTime()
+					if not onCooldown then
+						UseContainerItem(bag, slot)
+						return true
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+-- ==========================================
 -- Rotation Engine
 -- ==========================================
 
@@ -518,6 +581,9 @@ function RoguePoker:Rota()
 	local db          = RoguePokerDB
 	local cP          = GetComboPoints("player")
 	local energy      = UnitMana("player")
+
+	-- Top priority: reactive item use (e.g. Hourglass Sand on specific debuff)
+	if RoguePoker:UseReactiveItems() then return end
 
 	-- If current target is dead, clear it and find a new one
 	if UnitExists("target") and UnitIsDead("target") then
@@ -978,6 +1044,78 @@ cfgFrame:SetScript("OnDragStart", function() cfgFrame:StartMoving() end)
 cfgFrame:SetScript("OnDragStop", function() cfgFrame:StopMovingOrSizing() end)
 cfgFrame:Hide()
 
+cfgFrame:Hide()
+
+-- ==========================================
+-- Floating Builder Bar
+-- ==========================================
+local builderBar = CreateFrame("Frame", "RoguePokerBuilderBar", UIParent)
+builderBar:SetWidth(10) -- will resize when buttons are added
+builderBar:SetHeight(28)
+builderBar:SetBackdrop({
+	bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+	edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+	tile = true, tileSize = 16, edgeSize = 10,
+	insets = { left = 3, right = 3, top = 3, bottom = 3 }
+})
+builderBar:SetMovable(true)
+builderBar:EnableMouse(true)
+builderBar:RegisterForDrag("LeftButton")
+builderBar:SetScript("OnDragStart", function() builderBar:StartMoving() end)
+builderBar:SetScript("OnDragStop", function() builderBar:StopMovingOrSizing() end)
+builderBar:SetUserPlaced(true)
+builderBar:SetPoint("CENTER", UIParent, "CENTER", 0, 200)
+builderBar:Hide()
+
+local builderBarBtns = {}
+local knownBuilders  = {}
+local builderBtns    = {}
+
+local function RebuildBuilderBar()
+	for _, btn in ipairs(builderBarBtns) do btn:Hide() end
+	builderBarBtns = {}
+	if not RoguePokerDB or not RoguePokerDB.showBuilderBar then
+		builderBar:Hide()
+		return
+	end
+	local bX = 4
+	for _, name in ipairs(knownBuilders) do
+		local bName = name
+		local shortLabel = name
+		if name == "Noxious Assault" then shortLabel = "Noxious" end
+		if name == "Sinister Strike" then shortLabel = "Sinister" end
+		if name == "Hemorrhage"      then shortLabel = "Hemmorh" end
+		local btn = CreateFrame("Button", nil, builderBar, "UIPanelButtonTemplate")
+		btn:SetWidth(72)
+		btn:SetHeight(20)
+		btn:SetPoint("LEFT", builderBar, "LEFT", bX, 0)
+		btn:SetText(shortLabel)
+		btn.key = bName
+		btn:SetScript("OnClick", function()
+			RoguePokerDB.comboBuilder = bName
+			-- Update highlights on both the bar and the config panel buttons
+			for _, bb in ipairs(builderBarBtns) do
+				bb:SetAlpha(bb.key == bName and 1.0 or 0.55)
+			end
+			for _, bb in ipairs(builderBtns) do
+				bb:SetAlpha(bb.key == bName and 1.0 or 0.55)
+			end
+		end)
+		table.insert(builderBarBtns, btn)
+		bX = bX + 74
+	end
+	-- Resize bar to fit buttons
+	builderBar:SetWidth(bX + 2)
+	builderBar:Show()
+end
+
+local function UpdateBuilderBarHighlight()
+	if not RoguePokerDB then return end
+	for _, bb in ipairs(builderBarBtns) do
+		bb:SetAlpha(bb.key == RoguePokerDB.comboBuilder and 1.0 or 0.55)
+	end
+end
+
 local cfgTitle = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 cfgTitle:SetPoint("TOP", cfgFrame, "TOP", 0, -10)
 cfgTitle:SetText("RoguePoker Config")
@@ -1069,8 +1207,7 @@ builderTitle:SetPoint("TOPLEFT", tab1Panel, "TOPLEFT", 10, -8)
 builderTitle:SetText("Combo Builder:")
 builderTitle:SetTextColor(0.6, 0.8, 1)
 
-local knownBuilders = {}
-local builderBtns   = {}
+-- knownBuilders and builderBtns are declared above RebuildBuilderBar (hoisted)
 
 local function RebuildBuilderButtons()
 	for _, btn in ipairs(builderBtns) do btn:Hide() end
@@ -1097,6 +1234,7 @@ local function RebuildBuilderButtons()
 		table.insert(builderBtns, btn)
 		bX = bX + 86
 	end
+	RebuildBuilderBar()
 end
 
 local function UpdateBuilderHighlight()
@@ -1453,7 +1591,17 @@ local alwaysFeintCB, _ = MakeCheckbox(tab3Panel, "Always Feint (reduces threat)"
 	function() return RoguePokerDB and RoguePokerDB.alwaysFeint end,
 	function(v) if RoguePokerDB then RoguePokerDB.alwaysFeint = v end end)
 
-local insigniaCB, _ = MakeCheckbox(tab3Panel, "Use Insignia on CC", 10, -50,
+local showBuilderBarCB, _ = MakeCheckbox(tab3Panel, "Show Builder Bar", 10, -50,
+	function() return RoguePokerDB and RoguePokerDB.showBuilderBar end,
+	function(v)
+		if RoguePokerDB then
+			RoguePokerDB.showBuilderBar = v
+			RebuildBuilderBar()
+			UpdateBuilderBarHighlight()
+		end
+	end)
+
+local insigniaCB, _ = MakeCheckbox(tab3Panel, "Use Insignia on CC", 10, -72,
 	function() return RoguePokerDB and RoguePokerDB.useInsignia end,
 	function(v) if RoguePokerDB then RoguePokerDB.useInsignia = v end end)
 
@@ -1461,7 +1609,7 @@ local insigniaCB, _ = MakeCheckbox(tab3Panel, "Use Insignia on CC", 10, -50,
 local insigniaStunsCB = CreateFrame("CheckButton", nil, tab3Panel, "UICheckButtonTemplate")
 insigniaStunsCB:SetWidth(20)
 insigniaStunsCB:SetHeight(20)
-insigniaStunsCB:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 30, -68)
+insigniaStunsCB:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 30, -90)
 local insigniaStunsCBLabel = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 insigniaStunsCBLabel:SetPoint("LEFT", insigniaStunsCB, "RIGHT", 2, 0)
 insigniaStunsCBLabel:SetText("Stuns & Mind Control")
@@ -1477,7 +1625,7 @@ end)
 local insigniaMovementCB = CreateFrame("CheckButton", nil, tab3Panel, "UICheckButtonTemplate")
 insigniaMovementCB:SetWidth(20)
 insigniaMovementCB:SetHeight(20)
-insigniaMovementCB:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 30, -86)
+insigniaMovementCB:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 30, -108)
 local insigniaMovementCBLabel = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 insigniaMovementCBLabel:SetPoint("LEFT", insigniaMovementCB, "RIGHT", 2, 0)
 insigniaMovementCBLabel:SetText("Movement Impairing Effects")
@@ -1507,37 +1655,37 @@ insigniaCB:SetScript("OnClick", function()
 	end
 end)
 
-local sprintMovementCB, _ = MakeCheckbox(tab3Panel, "Use Sprint on Movement Impairing Effects", 10, -108,
+local sprintMovementCB, _ = MakeCheckbox(tab3Panel, "Use Sprint on Movement Impairing Effects", 10, -130,
 	function() return RoguePokerDB and RoguePokerDB.useSprintMovement end,
 	function(v) if RoguePokerDB then RoguePokerDB.useSprintMovement = v end end)
 
-local pvpModeCB, _ = MakeCheckbox(tab3Panel, "PvP Mode (disables Assist)", 10, -130,
+local pvpModeCB, _ = MakeCheckbox(tab3Panel, "PvP Mode (disables Assist)", 10, -152,
 	function() return RoguePokerDB and RoguePokerDB.pvpMode end,
 	function(v) if RoguePokerDB then RoguePokerDB.pvpMode = v end end)
 
-local tankModeCB, _ = MakeCheckbox(tab3Panel, "Tank Mode", 10, -152,
+local tankModeCB, _ = MakeCheckbox(tab3Panel, "Tank Mode", 10, -174,
 	function() return RoguePokerDB and RoguePokerDB.tankMode end,
 	function(v) if RoguePokerDB then RoguePokerDB.tankMode = v end end)
 
 -- ---- Auto Assist ----
 local assistSep = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-assistSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -178)
+assistSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -200)
 assistSep:SetText("------------------------------")
 assistSep:SetTextColor(0.4, 0.4, 0.4)
 
-local autoAssistCB, _ = MakeCheckbox(tab3Panel, "Auto Assist", 10, -194,
+local autoAssistCB, _ = MakeCheckbox(tab3Panel, "Auto Assist", 10, -216,
 	function() return RoguePokerDB and RoguePokerDB.autoAssist end,
 	function(v) if RoguePokerDB then RoguePokerDB.autoAssist = v end end)
 
 local assistNote = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-assistNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -216)
+assistNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -238)
 assistNote:SetText("When enabled and you have no target, assist this player:")
 assistNote:SetTextColor(0.7, 0.7, 0.7)
 
 local assistEditBox = CreateFrame("EditBox", "RoguePokerAssistEditBox", tab3Panel, "InputBoxTemplate")
 assistEditBox:SetWidth(200)
 assistEditBox:SetHeight(20)
-assistEditBox:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 14, -234)
+assistEditBox:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 14, -256)
 assistEditBox:SetAutoFocus(false)
 assistEditBox:SetMaxLetters(64)
 assistEditBox:SetText("")
@@ -1591,19 +1739,19 @@ end)
 
 -- ---- Auto Attack Setup ----
 local attackSep = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-attackSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -276)
+attackSep:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -298)
 attackSep:SetText("------------------------------")
 attackSep:SetTextColor(0.4, 0.4, 0.4)
 
 local attackNote = tab3Panel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-attackNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -290)
+attackNote:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -312)
 attackNote:SetText("Required for auto-attack detection (places Attack into slot 72):")
 attackNote:SetTextColor(0.7, 0.7, 0.7)
 
 local setupAttackBtn = CreateFrame("Button", nil, tab3Panel, "UIPanelButtonTemplate")
 setupAttackBtn:SetWidth(130)
 setupAttackBtn:SetHeight(22)
-setupAttackBtn:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -308)
+setupAttackBtn:SetPoint("TOPLEFT", tab3Panel, "TOPLEFT", 10, -330)
 setupAttackBtn:SetText("Setup Auto Attack")
 setupAttackBtn:SetScript("OnClick", function()
 	-- Find the Attack spell in the spellbook and place it into action slot 72
@@ -1674,6 +1822,7 @@ function RoguePoker:ScanAndRebuild()
 
 	-- Restore option checkboxes
 	alwaysFeintCB:SetChecked(db.alwaysFeint)
+	showBuilderBarCB:SetChecked(db.showBuilderBar)
 	insigniaCB:SetChecked(db.useInsignia)
 	insigniaStunsCB:SetChecked(db.useInsigniaStuns)
 	insigniaMovementCB:SetChecked(db.useInsigniaMovement)
@@ -1682,6 +1831,8 @@ function RoguePoker:ScanAndRebuild()
 	tankModeCB:SetChecked(db.tankMode)
 	pvpModeCB:SetChecked(db.pvpMode)
 	autoAssistCB:SetChecked(db.autoAssist)
+	RebuildBuilderBar()
+	UpdateBuilderBarHighlight()
 	assistEditBox:SetText(db.autoAssistName or "")
 end
 
@@ -1690,7 +1841,7 @@ end
 -- ==========================================
 local versionLabel = cfgFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 versionLabel:SetPoint("BOTTOMRIGHT", cfgFrame, "BOTTOMRIGHT", -8, 8)
-versionLabel:SetText("v1.2.0")
+versionLabel:SetText("v1.2.1")
 versionLabel:SetTextColor(0.5, 0.5, 0.5)
 
 -- ==========================================
@@ -1725,8 +1876,9 @@ updateFrame:SetScript("OnUpdate", function()
 	elapsed = elapsed + arg1
 	if elapsed < 0.3 then return end
 	elapsed = 0
-	if not RoguePokerDB or not cfgFrame:IsShown() then return end
+	if not RoguePokerDB then return end
 	UpdateBuilderHighlight()
+	UpdateBuilderBarHighlight()
 end)
 
 -- ==========================================
@@ -1782,6 +1934,7 @@ loadFrame:SetScript("OnEvent", function()
 		RefreshEvasionRows()
 		RefreshInterruptRows()
 		alwaysFeintCB:SetChecked(RoguePokerDB.alwaysFeint)
+		showBuilderBarCB:SetChecked(RoguePokerDB.showBuilderBar)
 		insigniaCB:SetChecked(RoguePokerDB.useInsignia)
 		insigniaStunsCB:SetChecked(RoguePokerDB.useInsigniaStuns)
 		insigniaMovementCB:SetChecked(RoguePokerDB.useInsigniaMovement)
@@ -1790,6 +1943,8 @@ loadFrame:SetScript("OnEvent", function()
 		tankModeCB:SetChecked(RoguePokerDB.tankMode)
 		pvpModeCB:SetChecked(RoguePokerDB.pvpMode)
 		autoAssistCB:SetChecked(RoguePokerDB.autoAssist)
+		RebuildBuilderBar()
+		UpdateBuilderBarHighlight()
 		assistEditBox:SetText(RoguePokerDB.autoAssistName or "")
 		print("|cFFFFD700RoguePoker|r loaded. Type |cFFFFD700/rp|r to configure.")
 	end
@@ -1814,6 +1969,9 @@ SlashCmdList["ROGUEPOKR"] = function(msg)
 		print("  |cFFAAAAAA/rp|r        -- Toggle configuration panel")
 		print("  |cFFAAAAAA/rp help|r   -- Show this help text")
 		print("  |cFFAAAAAA/rpassist|r  -- Assist the player set in the Auto Assist box")
+		print("  |cFFAAAAAA/rpdump|r    -- Dump current debuffs to CustomData/RoguePokerDebuffs.txt")
+		print("|cFFFFD700Builder Bar:|r")
+		print("  Enable 'Show Builder Bar' in Options to show a small draggable bar")
 	else
 		if cfgFrame:IsShown() then
 			cfgFrame:Hide()
